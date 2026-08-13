@@ -98,10 +98,23 @@ de to den fik.
 ### 4. Analyse og rapport
 
 ```bash
-python3 analyze.py     # -> data/metrics.json, data/metrics.csv
-python3 report.py      # -> docs/index.html
+python3 analyze.py           # -> data/metrics.json, data/metrics.csv
+python3 report.py            # -> docs/index.html
+python3 report_selftest.py   # 500+ kontroller på den færdige side
 open docs/index.html
 ```
+
+Rapporten er én HTML-fil uden eksterne afhængigheder: ingen webfonte, intet
+diagrambibliotek, ingen netværkskald. Alle 420 svar ligger inde i filen, så
+hvert tal kan følges tilbage til den tekst, det kommer fra.
+
+`report_selftest.py` tester den færdige side mod de metodiske invarianter — at
+de fire celler aldrig lægges sammen, at der ikke uddeles pladsnumre, at butiks-
+og mærketal aldrig står i samme graf, at spørgsmålsniveauet opgøres i tællinger
+og ikke procenter, at forbeholdene er en fuld sektion der ikke kan foldes væk,
+at udløbsstemplet står over folden, og at ingen entitet er udeladt eller
+nedtonet. Bryder en ændring én af dem, er rapporten forkert, uanset hvor godt
+den ser ud.
 
 ## Filer
 
@@ -114,6 +127,7 @@ open docs/index.html
 | `analyze.py` | Ekstraktion og metrikker |
 | `report.py` | Bygger den selvstændige HTML-fil |
 | `selftest.py` | Værn-tests, ingen API-kald |
+| `report_selftest.py` | Invariant-tests på den færdige HTML |
 | `candidates.py` | Manuelt trin uden for pipelinen |
 | `report_plan.md` | Forudregistrering, committet før kørslen |
 

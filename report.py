@@ -4,19 +4,30 @@ Usage:
     python3 analyze.py && python3 report.py
 
 Writes docs/index.html — a single file with inlined CSS, no external fonts,
-no scripts, no chart library. It must still open in three years, and it must
-render with the network cable pulled out.
+no chart library, no network calls. It must still open in three years, and it
+must render with the network cable pulled out.
 
-Visual direction is Danish milk-carton print: raw board, printed ink blue, a
-red date stamp, monospaced figures on anything measured. The signature element
-is the "Mindst holdbar til" stamp, because the most honest thing about an
-LLM measurement is that it expires.
+Visual direction follows the Knowit design handoff (design_handoff_synlighedsmaaling):
+one weight, hierarchy from size alone, rounded windows on Knowit White, charts on
+a dark surface, a red expiry date and nothing else in red. Every number on the page
+is computed here from data/metrics.json — none of them are written into the markup
+by hand. That is the point of the data contract, not a style preference.
+
+Deviations from the prototype, all forced by the real dataset:
+  * the prototype had 8 entities per family; the measurement has 74. The matrix
+    shows all of them, grouped by band (never ranked, never dimmed, never hidden).
+  * the prototype had 3 of 35 questions rendered verbatim; all 35 are here, with
+    all 420 answers behind them.
+  * per-cell toplines, Wilson boundary daggers and the full metric table exist in
+    the data and had nowhere to live in the prototype, so they got places.
 """
 
 from __future__ import annotations
 
 import html
 import json
+import math
+import re
 from datetime import datetime, timedelta, timezone
 
 import config
@@ -29,13 +40,46 @@ CELL_LABELS = {
 }
 CELL_ORDER = ["claude/nosearch", "claude/search", "gpt/nosearch", "gpt/search"]
 
+TYPE_LABEL = {"maerke": "Mærker", "butik": "Butikker"}
+TYPE_SINGULAR = {"maerke": "mærke", "butik": "butik"}
+FAM_KEY = {"maerke": "brands", "butik": "shops"}
+
+INTENT_LABEL = {
+    "pris": "pris",
+    "smag": "smag",
+    "anvendelse": "anvendelse",
+    "vaerdier": "værdier",
+    "sammenligning": "sammenligning",
+}
+
+
+# --- Small helpers -----------------------------------------------------------
+
 
 def esc(value) -> str:
     return html.escape(str(value), quote=True)
 
 
-def pct(value: float | None) -> str:
-    return "—" if value is None else f"{value * 100:.0f}%"
+def pct(rate: float | None, decimals: int = 0) -> str:
+    """Danish percent: comma decimal separator, non-breaking space before %."""
+    if rate is None:
+        return "—"
+    value = rate * 100
+    text = f"{value:.{decimals}f}".replace(".", ",")
+    return f"{text}&nbsp;%"
+
+
+def dec(value: float, decimals: int = 2) -> str:
+    return f"{value:.{decimals}f}".replace(".", ",")
+
+
+def cell_name(cell: str) -> str:
+    model, condition = CELL_LABELS.get(cell, (cell, ""))
+    return f"{model} {condition}".strip()
+
+
+def dk_date(iso: str) -> str:
+    return f"{iso[8:10]}.{iso[5:7]}.{iso[0:4]}"
 
 
 def load() -> dict:
@@ -50,8 +94,8 @@ def load_answers() -> list[dict]:
     """All 420 answers, published in full alongside the report.
 
     The artifact's central claim is that anyone can re-run it and get the same
-    numbers. Keeping the evidence behind the numbers hidden would weaken
-    exactly that claim, so the transcripts ship with the page.
+    numbers. Keeping the evidence behind the numbers hidden would weaken exactly
+    that claim, so the transcripts ship with the page.
     """
     path = config.DATA_DIR / "answers.json"
     if not path.exists():
@@ -59,510 +103,963 @@ def load_answers() -> list[dict]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-# --- Components --------------------------------------------------------------
+# --- Derived views over the metrics ------------------------------------------
 
 
-def bar_group(data: dict, cells: list[str]) -> str:
-    """Four thin bars per entity — one per cell. Never a pooled figure."""
-    rows = []
-    for cell in cells:
-        stats = data["cells"].get(cell)
-        if not stats:
-            continue
-        model, condition = CELL_LABELS.get(cell, (cell, ""))
-        rate = stats["mention_rate"]
-        dagger = config.BOUNDARY_MARKER if stats["boundary_uncertain"] else ""
-        rows.append(
-            f'<div class="bar-row">'
-            f'<span class="bar-label">{esc(model)} <em>{esc(condition)}</em></span>'
-            f'<span class="bar-track"><span class="bar-fill" style="width:{rate * 100:.1f}%"></span></span>'
-            f'<span class="bar-value">{pct(rate)}{dagger}</span>'
-            f"</div>"
-        )
-    if not rows:
-        return ""
-    note = f' <span class="note">{esc(data["note"])}</span>' if data.get("note") else ""
-    return (
-        f'<div class="entity">'
-        f'<div class="entity-name">{esc(data["display"])}{note}</div>'
-        f'{"".join(rows)}'
-        f"</div>"
-    )
+def band_of(rate: float) -> str:
+    for name, low, high in config.VISIBILITY_BANDS:
+        if low <= rate < high:
+            return name
+    return config.VISIBILITY_BANDS[-1][0]
 
 
-def chart(result: dict, entity_type: str, heading: str, blurb: str) -> str:
-    cells = [cell for cell in CELL_ORDER if cell in result["meta"]["cells"]]
-    ranked = [
-        data for data in result["entities"].values()
-        if data["type"] == entity_type
+def band_class(band: str) -> str:
+    return {"synlig": "vis", "marginal": "mar", "usynlig": "usy"}[band]
+
+
+def family(result: dict, etype: str) -> dict:
+    """One entity family: every entity of that type that was ever mentioned.
+
+    Sorted by highest rate across cells. That is an ordering, not a ranking —
+    the bands carry the claim, and the table says so.
+    """
+    cells = [c for c in CELL_ORDER if c in result["meta"]["cells"]]
+    rows = [
+        data
+        for data in result["entities"].values()
+        if data["type"] == etype
         and any(stat["mentions"] for stat in data["cells"].values())
     ]
-    ranked.sort(
-        key=lambda d: -max((s["mention_rate"] for s in d["cells"].values()), default=0)
+    rows.sort(key=lambda d: -max(s["mention_rate"] for s in d["cells"].values()))
+
+    ceiling = max(
+        (s["ci_high"] for d in rows for s in d["cells"].values()), default=0.1
     )
-    ranked = ranked[: config.TOP_N_CHART]
-    if not ranked:
-        return f"<h2>{esc(heading)}</h2><p>Ingen {esc(entity_type)}er blev nævnt i målingen.</p>"
+    axis = min(1.0, math.ceil(ceiling * 10) / 10)
 
-    groups = "".join(bar_group(data, cells) for data in ranked)
-    return (
-        f"<h2>{esc(heading)}</h2>"
-        f"<p>{blurb}</p>"
-        f'<div class="chart">{groups}</div>'
-        f'<p class="footnote">Hver entitet vises i alle fire celler hver for sig. '
-        f"Der findes ikke ét samlet tal i denne rapport — en model med søgning og "
-        f"en uden er ikke den samme population. "
-        f"{config.BOUNDARY_MARKER} betyder, at konfidensintervallet krydser en båndgrænse, "
-        f"så entitetens bånd ikke er afgjort.</p>"
-    )
+    for data in rows:
+        best = max(s["mention_rate"] for s in data["cells"].values())
+        data["_best"] = best
+        data["_band"] = band_of(best)
+        data["_worst"] = min(s["mention_rate"] for s in data["cells"].values())
+
+    return {
+        "type": etype,
+        "fam": FAM_KEY[etype],
+        "label": TYPE_LABEL[etype],
+        "rows": rows,
+        "axis": axis,
+        "cells": cells,
+        "never": [
+            data["display"]
+            for data in result["entities"].values()
+            if data["type"] == etype
+            and not any(stat["mentions"] for stat in data["cells"].values())
+        ],
+    }
 
 
-def key_figures(result: dict) -> str:
+def extreme(fam: dict) -> dict:
+    """Highest single-cell rate in a family, plus the same entity's lowest cell.
+
+    Never an average across cells — the four cells are four populations.
+    """
+    best_entity, best_cell, best_rate = None, None, -1.0
+    for data in fam["rows"]:
+        for cell in fam["cells"]:
+            rate = data["cells"][cell]["mention_rate"]
+            if rate > best_rate:
+                best_entity, best_cell, best_rate = data, cell, rate
+    low_cell = min(fam["cells"], key=lambda c: best_entity["cells"][c]["mention_rate"])
+    return {
+        "entity": best_entity,
+        "cell": best_cell,
+        "rate": best_rate,
+        "low_cell": low_cell,
+        "low_rate": best_entity["cells"][low_cell]["mention_rate"],
+    }
+
+
+def invisible_everywhere(fam: dict) -> int:
+    return sum(1 for d in fam["rows"] if d["_band"] == "usynlig")
+
+
+def display_names(result: dict, keys: list[str]) -> list[str]:
+    out = []
+    for key in keys:
+        data = result["entities"].get(key)
+        out.append(data["display"] if data else key)
+    return out
+
+
+# --- Section 0: masthead and cover -------------------------------------------
+
+
+def cover(result: dict, measured: str, expires: str) -> str:
     meta = result["meta"]
-    bands = {"synlig": 0, "marginal": 0, "usynlig": 0}
-    for data in result["entities"].values():
-        best = max(
-            (stat for stat in data["cells"].values()),
-            key=lambda s: s["mention_rate"],
-            default=None,
-        )
-        if best and best["mentions"]:
-            bands[best["band"]] = bands.get(best["band"], 0) + 1
+    models = " · ".join(meta["models"].values())
+    passes = len(meta["passes"])
+    cells = len(meta["cells"])
+    return f"""
+<div class="top">
+  <span><b>Rapport</b></span>
+  <span>Synlighed i sprogmodeller · dansk mejeri</span>
+  <span>Måling {esc(dk_date(measured))}</span>
+  <span class="r">Uafhængig måling · egne API-nøgler · version 1.0</span>
+</div>
 
-    tiles = [
-        ("Svar indsamlet", f'{meta["answers"]}', f'{meta["questions"]} spørgsmål × {len(meta["cells"])} celler'),
-        ("Synlige entiteter", f'{bands["synlig"]}', "nævnt i over 40 % af svarene"),
-        ("Marginale", f'{bands["marginal"]}', "10–40 % — til stede, men ikke pålideligt"),
-        ("Usynlige", f'{bands["usynlig"]}', "under 10 % — nævnt, men næsten aldrig"),
+<div class="aurora" aria-hidden="true"></div>
+
+<div class="hero">
+  <div>
+    <h1>Når en dansker spørger en sprogmodel om mejeri, <em>hvem bliver så nævnt</em>
+      — og hvem findes slet ikke i svaret?</h1>
+    <p class="stand">Analyseenheden er spørgsmålet, ikke mærket.
+      {esc(meta['questions'])} spørgsmål på dansk blev stillet i {esc(cells)} celler og
+      kørt {esc(passes)} gange i hver: {esc(meta['answers'])} svar. Ingen af spørgsmålene
+      nævner et mærke- eller butiksnavn. Rapporten kan læses fra opsummeringen og ned,
+      eller åbnes ved et enkelt spørgsmål — alle {esc(meta['answers'])} svar ligger i den
+      her fil.</p>
+  </div>
+  <div class="heroside">
+    <div class="stampbox">
+      <div class="a">Mindst holdbar til</div>
+      <div class="b">{esc(expires)}</div>
+      <div class="c">{esc(config.SHELF_LIFE_DAYS)} dage efter måling. Herefter er tallene
+        historik, ikke status.</div>
+    </div>
+    <div class="facts">
+      <dl>
+        <dt>Omfang</dt><dd>{esc(meta['questions'])} spørgsmål · {esc(cells)} celler ·
+          {esc(passes)} kørsler</dd>
+        <dt>Grundlag</dt><dd>{esc(meta['answers'])} svar</dd>
+        <dt>Modeller</dt><dd>{esc(models)}</dd>
+        <dt>Forbehold</dt><dd>Afsnit 5</dd>
+      </dl>
+    </div>
+  </div>
+</div>
+"""
+
+
+# --- Section 1: kort fortalt --------------------------------------------------
+
+
+def summary_cards(result: dict, brands: dict, shops: dict) -> str:
+    top_brand = extreme(brands)
+    top_shop = extreme(shops)
+    defunct = result["defunct"]["per_cell"]
+
+    worst_cell = max(defunct, key=lambda c: defunct[c]["answers_with_error"])
+    same_model = worst_cell.split("/")[0]
+    other = f"{same_model}/{'search' if worst_cell.endswith('nosearch') else 'nosearch'}"
+    clean_cells = [c for c in CELL_ORDER if defunct.get(c, {}).get("answers_with_error") == 0]
+
+    nos = result["disagreement"]["nosearch"]["jaccard"]
+    sea = result["disagreement"]["search"]["jaccard"]
+
+    inv_b, inv_s = invisible_everywhere(brands), invisible_everywhere(shops)
+    n_b, n_s = len(brands["rows"]), len(shops["rows"])
+
+    # The stores never reach the top band in any cell. That is a finding, and it
+    # is computed, not assumed — if a future run breaks it, the sentence changes.
+    no_visible_shop = all(d["_band"] != "synlig" for d in shops["rows"])
+    shop_tail = (
+        " Ingen dagligvarekæde når over 40&nbsp;% i nogen af de fire celler."
+        if no_visible_shop else ""
+    )
+
+    cards = [
+        {
+            "lb": "Mest nævnte mærke",
+            "fig": pct(top_brand["rate"]),
+            "who": top_brand["entity"]["display"],
+            "sen": (
+                f"af de {result['meta']['cell_sizes'][top_brand['cell']]} svar i cellen "
+                f"{esc(cell_name(top_brand['cell']))} nævner "
+                f"{esc(top_brand['entity']['display'])} mindst én gang. I "
+                f"{esc(cell_name(top_brand['low_cell']))} er det "
+                f"{pct(top_brand['low_rate'])} — samme spørgsmål, samme dag."
+            ),
+            "ref": (
+                f"celle: {esc(cell_name(top_brand['cell']))} · modsat yderpunkt: "
+                f"{esc(cell_name(top_brand['low_cell']))}"
+            ),
+        },
+        {
+            "lb": "Mest nævnte butik",
+            "fig": pct(top_shop["rate"]),
+            "who": top_shop["entity"]["display"],
+            "sen": (
+                f"af svarene i cellen {esc(cell_name(top_shop['cell']))} nævner "
+                f"{esc(top_shop['entity']['display'])}. I "
+                f"{esc(cell_name(top_shop['low_cell']))} er det "
+                f"{pct(top_shop['low_rate'])}.{shop_tail}"
+            ),
+            "ref": (
+                f"celle: {esc(cell_name(top_shop['cell']))} · butiks- og mærketal har "
+                f"hver sin akse"
+            ),
+        },
+        {
+            "lb": "Usynlige i alle fire celler",
+            "fig": f"{inv_b} af {n_b}",
+            "who": "mejerimærker",
+            "sen": (
+                f"ligger under 10&nbsp;% i <em>alle</em> fire celler — nævnt, men "
+                f"praktisk taget uden for svaret uanset hvilken model forbrugeren "
+                f"bruger. For butikker: {inv_s} af {n_s}."
+            ),
+            "ref": "bånd: under 10&nbsp;% = usynlig · ingen entitet er udeladt af tabellen",
+        },
+        {
+            "lb": "Faktuelt forkert købsråd",
+            "fig": (
+                f"{defunct[worst_cell]['answers_with_error']} → "
+                f"{defunct[other]['answers_with_error']}"
+            ),
+            "small": f"af {defunct[worst_cell]['answers']}",
+            "alert": True,
+            "who": "lukkede kæder",
+            "sen": (
+                f"svar anbefaler en dagligvarekæde, der ikke findes længere, uden at "
+                f"nævne lukningen. Websøgning skærer fejlen ned — den fjerner den ikke. "
+                + (
+                    f"{esc(' og '.join(cell_name(c) for c in clean_cells))}: 0 fejl."
+                    if clean_cells else ""
+                )
+            ),
+            "ref": f"celler: {esc(cell_name(worst_cell))} → {esc(cell_name(other))}",
+        },
+        {
+            "lb": "Enighed mellem modellerne",
+            "fig": f"{dec(nos)} → {dec(sea)}",
+            "who": "overlap på de mest omtalte",
+            "sen": (
+                "Uden søgning svarer de to modeller fra beslægtede hukommelser. Med "
+                "søgning henter de hver sit — og bliver uenige om, hvem der findes."
+            ),
+            "ref": "Jaccard, beregnet inden for samme betingelse",
+        },
     ]
-    cards = "".join(
-        f'<div class="tile"><div class="tile-label">{esc(label)}</div>'
-        f'<div class="tile-value">{esc(value)}</div>'
-        f'<div class="tile-sub">{esc(sub)}</div></div>'
-        for label, value, sub in tiles
-    )
 
-    rows = "".join(
-        f"<tr><td>{esc(CELL_LABELS.get(cell, (cell, ''))[0])} "
-        f"<em>{esc(CELL_LABELS.get(cell, ('', cell))[1])}</em></td>"
-        f'<td class="num">{pct(t["share_with_brand"])}</td>'
-        f'<td class="num">{pct(t["share_with_store"])}</td>'
-        f'<td class="num">{t["avg_brands_per_answer"]}</td>'
-        f'<td class="num">{t["avg_stores_per_answer"]}</td></tr>'
-        for cell, t in sorted(result["toplines"].items(), key=lambda kv: CELL_ORDER.index(kv[0]) if kv[0] in CELL_ORDER else 99)
-    )
+    html_cards = "".join(card_html(c) for c in cards)
 
-    return (
-        f"<h2>Nøgletal</h2>"
-        f'<div class="tiles">{cards}</div>'
-        f'<div class="scroll"><table>'
-        f"<thead><tr><th>Celle</th><th>Svar med mærke</th><th>Svar med butik</th>"
-        f"<th>Mærker pr. svar</th><th>Butikker pr. svar</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table></div>"
-        f'<p class="jump noprint"><a href="#register">Gå til spørgsmålsregisteret — alle 35 spørgsmål og alle 420 svar i fuld længde →</a></p>'
-        f'<p class="footnote">Butiks- og mærketal må ikke sammenlignes indbyrdes. '
-        f"De deler nævner, men ikke mulighedsrum: et prisspørgsmål kan fremkalde en "
-        f"butik, et smagsspørgsmål kan ikke.</p>"
-    )
-
-
-def defunct_section(result: dict) -> str:
-    defunct = result["defunct"]
-    total_errors = sum(c["answers_with_error"] for c in defunct["per_cell"].values())
-
-    chains = "".join(
-        f"<li><strong>{esc(c['display'])}</strong> — ophørte {esc(c['ended'])}. {esc(c['detail'])}</li>"
-        for c in defunct["chains"].values()
-    )
-
-    if total_errors == 0:
-        body = (
-            "<p><strong>Ingen af modellerne anbefalede en udgået kæde i denne måling.</strong> "
-            "Sektionen står alligevel, fordi tjekket er en del af metoden og ikke af resultatet.</p>"
-        )
-    else:
-        rows = "".join(
-            f"<tr><td>{esc(CELL_LABELS.get(cell, (cell, ''))[0])} "
-            f"<em>{esc(CELL_LABELS.get(cell, ('', cell))[1])}</em></td>"
-            f'<td class="num">{stats["answers_with_error"]}/{stats["answers"]}</td>'
-            f'<td class="num">{pct(stats["error_rate"])}</td>'
-            f'<td class="num">{stats["answers_stating_closure_correctly"]}</td></tr>'
-            for cell, stats in sorted(
-                defunct["per_cell"].items(),
-                key=lambda kv: CELL_ORDER.index(kv[0]) if kv[0] in CELL_ORDER else 99,
-            )
-        )
-        quotes = "".join(
-            f"<blockquote>{esc(q['quote'])}"
-            f"<cite>{esc(CELL_LABELS.get(q['cell'], (q['cell'], ''))[0])} "
-            f"{esc(CELL_LABELS.get(q['cell'], ('', q['cell']))[1])} — "
-            f"spørgsmål: {esc(q['question'])}</cite></blockquote>"
-            for q in defunct["quotes"][:3]
-        )
-        body = (
-            f'<div class="scroll"><table>'
-            f"<thead><tr><th>Celle</th><th>Svar med fejl</th><th>Andel</th>"
-            f"<th>Svar der beskriver lukningen korrekt</th></tr></thead>"
-            f"<tbody>{rows}</tbody></table></div>"
-            f"<p>Ordret, fra de rå svar:</p>{quotes}"
-        )
-
-    return (
-        f'<h2 class="alarm-heading">Udgåede kæder</h2>'
-        f"<p>Tre danske dagligvarekæder findes ikke længere:</p>"
-        f"<ul>{chains}</ul>"
-        f"<p>Anbefales de stadig, er det ikke en smagssag. Det er faktuelt forkert "
-        f"købsråd, leveret med samme sikkerhed som det rigtige, og en forbruger kan "
-        f"ikke se forskel.</p>"
-        f"{body}"
-        f'<p class="footnote">En omtale tælles kun som fejl, hvis den står uden en '
-        f"lukningsmarkør i nærheden. Et svar som «Aldi forlod Danmark i 2023» er "
-        f"modellen der har ret, og tælles ikke som fejl.</p>"
-    )
-
-
-def full_table(result: dict) -> str:
-    cells = [cell for cell in CELL_ORDER if cell in result["meta"]["cells"]]
-    rows = []
-    entries = [
-        data for data in result["entities"].values()
-        if any(stat["mentions"] for stat in data["cells"].values())
-    ]
-    entries.sort(key=lambda d: (d["type"], -max(s["mention_rate"] for s in d["cells"].values())))
-
-    for data in entries:
-        for cell in cells:
-            stats = data["cells"].get(cell)
-            if not stats or not stats["mentions"]:
-                continue
-            model, condition = CELL_LABELS.get(cell, (cell, ""))
-            dagger = config.BOUNDARY_MARKER if stats["boundary_uncertain"] else ""
-            rows.append(
-                f"<tr><td>{esc(data['display'])}</td><td>{esc(data['type'])}</td>"
-                f"<td>{esc(model)} <em>{esc(condition)}</em></td>"
-                f'<td class="num">{pct(stats["mention_rate"])}{dagger}</td>'
-                f'<td class="num">{pct(stats["ci_low"])}–{pct(stats["ci_high"])}</td>'
-                f'<td class="num">{pct(stats["share_of_voice"])}</td>'
-                f'<td class="num">{pct(stats["first_mentioned_rate"])}</td>'
-                f'<td class="num">{pct(stats["consistency"])}</td>'
-                f'<td class="num">{esc(stats["band"])}</td></tr>'
-            )
-    return (
-        f"<h2>Fuld tabel</h2>"
-        f'<div class="scroll"><table><thead><tr>'
-        f"<th>Entitet</th><th>Type</th><th>Celle</th><th>Omtale-rate</th>"
-        f"<th>95 % interval</th><th>Share of voice</th><th>Først nævnt</th>"
-        f"<th>Konsistens</th><th>Bånd</th></tr></thead>"
-        f"<tbody>{''.join(rows)}</tbody></table></div>"
-        f'<p class="footnote">{esc(result["meta"]["ci_note"])} '
-        f"Konsistens er andelen af kørsler, hvor entiteten optrådte, blandt de "
-        f"spørgsmål hvor den optrådte mindst én gang. En entitet med lav konsistens "
-        f"er ikke synlig — den er heldig.</p>"
-    )
-
-
-def disagreement_section(result: dict) -> str:
-    blocks = []
-    for condition, data in result["disagreement"].items():
-        label = "uden websøgning" if condition == "nosearch" else "med websøgning"
-        only = {k: v for k, v in data.items() if k.startswith("only_in_")}
-        lists = "".join(
-            f"<p><strong>Kun {esc(key.replace('only_in_', ''))}:</strong> "
-            f"{esc(', '.join(values)) if values else 'ingen'}</p>"
-            for key, values in only.items()
-        )
-        blocks.append(
-            f"<h3>{esc(label)}</h3>"
-            f'<p>Jaccard-overlap mellem modellernes top-10: <span class="mono">{data["jaccard"]:.2f}</span></p>'
-            f"<p><strong>Nævnt af begge:</strong> {esc(', '.join(data['shared'])) or 'ingen'}</p>"
-            f"{lists}"
-        )
-    return (
-        f"<h2>Modeluenighed</h2>"
-        f"<p>Overlappet er beregnet inden for hver betingelse. At sammenligne en "
-        f"søgende model med en ikke-søgende ville måle indstillingen, ikke modellerne.</p>"
-        f"{''.join(blocks)}"
-        f'<p class="footnote">Et lavt overlap betyder, at hvilken model forbrugeren '
-        f"tilfældigvis bruger, afgør hvilke mærker de præsenteres for.</p>"
-    )
-
-
-def intent_section(result: dict) -> str:
-    rows = "".join(
-        f"<tr><td>{esc(intent)}</td>"
-        f'<td class="num">{data["questions"]}</td>'
-        f'<td>{esc(", ".join(data["top_stores"])) or "—"}</td>'
-        f'<td>{esc(", ".join(data["top_brands"])) or "—"}</td></tr>'
+    intent_cards = "".join(
+        f'<div class="intblock int-{esc(intent)}">{card_html(intent_card(result, intent, data))}</div>'
         for intent, data in result["by_intent"].items()
     )
-    return (
-        f"<h2>Opdeling på spørgsmålstype</h2>"
-        f"<p>Denne sektion er bevidst kvalitativ. Med 35 spørgsmål fordelt på fem "
-        f"intentioner ville en procent per intention hvile på syv spørgsmål — det er "
-        f"anekdote med decimaler på. Retningen er derimod tydelig nok til at nævne.</p>"
-        f'<div class="scroll"><table><thead><tr><th>Intention</th><th>Spørgsmål</th>'
-        f"<th>Hyppigste butikker</th><th>Hyppigste mærker</th></tr></thead>"
-        f"<tbody>{rows}</tbody></table></div>"
-    )
 
-
-def limitations() -> str:
-    return """
-<h2>Hvad målingen ikke kan sige</h2>
-<p>Denne sektion er ikke en formalitet. Den er forskellen på en analyse og en pitch.</p>
-<h3>Volumen</h3>
-<p>Målingen siger intet om, hvor mange danskere der faktisk spørger en sprogmodel til
-råds, før de handler ind. Tallet kan være lille. Der er ingen offentligt tilgængelig
-kilde, jeg kan reproducere, og jeg har bevidst undladt at bruge betalte data, fordi
-en rapport hvis pointe er efterprøvelighed ikke kan hvile på et tal, læseren ikke
-kan efterprøve.</p>
-<h3>Årsag</h3>
-<p>Målingen viser, hvad modellerne svarer — ikke hvorfor. Om et mærke nævnes ofte,
-fordi det er markedsledende, fordi det fylder meget i træningsdata, eller fordi det
-optræder i de kilder en søgning rammer, kan denne metode ikke afgøre. Kortlægning af
-kilderne bag svarene er et selvstændigt stykke arbejde.</p>
-<h3>Konvertering</h3>
-<p>At blive nævnt er ikke at blive købt. Der er intet i denne måling, der forbinder en
-omtale med et salg, en butiksbesøg eller så meget som et klik.</p>
-<h3>Udløb</h3>
-<p>Det her er et øjebliksbillede. Modeller opdateres uden varsel, søgeindekser ændrer
-sig dagligt, og udbydernes standardindstillinger skifter. Kørte man det samme igen om
-tre måneder, ville tallene være anderledes — og man ville ikke kunne vide, om det
-skyldtes markedet eller modellen. Derfor står der en udløbsdato øverst.</p>
-<h3>Repræsentativitet</h3>
-<p>De 35 spørgsmål er skrevet af én person. Ingen test kan afgøre, om de repræsenterer,
-hvordan danskere faktisk spørger. Spørgsmålene ligger i repoet, så man kan være
-konkret uenig i dem.</p>
-"""
-
-
-def method_section(result: dict) -> str:
-    meta = result["meta"]
-    spans = "".join(
-        f"<li>Kørsel {esc(s['pass'])}: {esc(s['first'][:16].replace('T', ' '))} – "
-        f"{esc(s['last'][:16].replace('T', ' '))} UTC</li>"
-        for s in meta["pass_spans"]
-    )
-    models = "".join(
-        f"<li><span class=\"mono\">{esc(model_id)}</span></li>"
-        for model_id in meta["models"].values()
-    )
     return f"""
-<h2>Metode</h2>
-<p>Spørgsmålene indeholder ingen mærke- eller butiksnavne. Et spørgsmål med «Arla» i
-ville måle genkendelse, ikke synlighed. Det håndhæves af en test, ikke af disciplin.</p>
-<h3>Modeller</h3>
-<ul>{models}</ul>
-<p>Ingen systemprompt. Udbyderens øvrige standardindstillinger. Bemærk, at
-standardindstillinger ikke er det samme på tværs af udbydere — <span class="mono">claude-opus-5</span>
-tænker som standard. Forskelle mellem modellerne er derfor delvis forskelle mellem
-udbydernes defaults, ikke kun mellem modellerne.</p>
-<h3>Design</h3>
-<p>Hvert spørgsmål blev stillet i fire celler: to modeller × to betingelser (uden og
-med websøgning). Hver celle blev kørt {esc(len(meta['passes']))} gange.
-{esc(meta['answers'])} svar i alt. {esc(meta['truncated_answers'])} svar var afkortede.</p>
-<ul>{spans}</ul>
-<h3>Ekstraktion</h3>
-<p>Omtaler findes med ordbog og regulære udtryk. Ingen sprogmodel deltager i tællingen.
-Ordbogen ligger i <span class="mono">entities.py</span> og kan gennemgås linje for linje.
-Danske faldgruber er håndteret med positionelle værn: «spar penge» er ikke butikskæden
-SPAR, «netto 400 gram» er ikke Netto, men «Netto har gode priser på 400 gram ost» er.
-Værnene er dækket af tests, der kører uden et eneste API-kald.</p>
-<p>Kun første forekomst per entitet per svar tælles. Ellers ville et langt, snakkesaligt
-svar veje tungere end et kort, og så målte vi ordrigdom.</p>
-<h3>Ordbogens dækning</h3>
-<p>Efter ekstraktion udskrives kapitaliserede navne, som optrådte i svarene men ikke stod
-i ordbogen, så hullerne findes systematisk frem for ved gætteri. Det var sådan
-Coop, Milbona og Levevis kom med.</p>
-<h3>Usikkerhed</h3>
-<p>{esc(meta['ci_note'])}</p>
-<h3>Forudregistrering</h3>
-<p>Rapportens sektioner og synlighedsbåndenes grænser blev låst i
-<span class="mono">report_plan.md</span> før den fulde kørsel. Git-historikken viser hvornår.</p>
-<h3>Reproduktion</h3>
-<p>Koden er offentlig. <span class="mono">README.md</span> beskriver, hvordan man kører
-målingen igen med sine egne nøgler.</p>
+<section class="window lpurple" id="kort">
+  <div class="wtop">
+    <h2>Kort fortalt</h2>
+    <div class="r">Hvert tal hører til én navngiven celle · ingen af tallene er et
+      gennemsnit af de fire</div>
+  </div>
+  <div class="cards">{html_cards}{intent_cards}</div>
+  <p class="small" style="margin:24px 0 0">Der findes ikke ét samlet synlighedstal i
+    rapporten, og det er ikke tilbageholdenhed: de fire celler måler ikke det samme, og
+    et gennemsnit af dem ville være et tal, ingen bruger nogensinde har mødt. Derfor står
+    hvert tal med den celle, det kommer fra — og hvor det er relevant, står tallet fra
+    den celle, hvor det ser dårligst ud, lige ved siden af.</p>
+</section>
 """
 
 
-# --- Section 12: question register -------------------------------------------
+def card_html(c: dict) -> str:
+    unit = f'<small>{c["small"]}</small>' if c.get("small") else ""
+    return (
+        f'<div class="card{" accent" if c.get("accent") else ""}">'
+        f'<div class="lb">{c["lb"]}</div>'
+        f'<div class="fig{" alert" if c.get("alert") else ""}">{c["fig"]}{unit}</div>'
+        f'<div class="who">{c["who"]}</div>'
+        f'<p class="sen">{c["sen"]}</p>'
+        f'<div class="ref">{c["ref"]}</div></div>'
+    )
 
 
-def question_register(result: dict) -> str:
-    """Static list of all 35 questions, grouped by intent.
+def intent_card(result: dict, intent: str, data: dict) -> dict:
+    stores = display_names(result, data["top_stores"])
+    brands = display_names(result, data["top_brands"])
+    return {
+        "accent": True,
+        "lb": f"Den valgte intention: «{esc(INTENT_LABEL.get(intent, intent))}»",
+        "fig": str(data["questions"]),
+        "small": "spørgsmål",
+        "who": "fremkalder oftest netop disse",
+        "sen": (
+            f"Butikker: {esc(', '.join(stores))}. Mærker: {esc(', '.join(brands))}. "
+            f"{data['answers']} svar i intentionen, "
+            f"{data['store_mentions']} butiksomtaler og {data['brand_mentions']} "
+            f"mærkeomtaler i alt."
+        ),
+        "ref": "kvalitativ liste · ingen placeringer",
+    }
 
-    Rendered server-side so it survives printing and works without JavaScript.
-    The interactive case file below it is progressive enhancement, not a
-    prerequisite for reading the page.
-    """
+
+# --- Section 2: the questions -------------------------------------------------
+
+
+def questions_section(result: dict, answers: list[dict]) -> str:
+    meta = result["meta"]
     by_intent: dict[str, list[dict]] = {}
     for question in result["questions"]:
         by_intent.setdefault(question["intent"], []).append(question)
 
-    blocks = []
-    for intent, items in by_intent.items():
-        rows = "".join(
-            f'<li><button class="q-item" data-q="{esc(q["id"])}" type="button">'
-            f'<span class="q-id">{esc(q["id"])}</span>'
-            f'<span class="q-text">{esc(q["text"])}</span></button></li>'
-            for q in items
+    n_cells = len(meta["cells"])
+    n_runs = len(meta["passes"])
+    per_q = n_cells * n_runs
+
+    tiles = "".join(
+        intent_tile(intent, items, per_q) for intent, items in by_intent.items()
+    )
+    n_err = sum(
+        1
+        for q in result["questions"]
+        if any(c.get("defunct_errors") for c in q["cells"].values())
+    )
+
+    lists = "".join(
+        f'<div class="intblock int-{esc(intent)}">'
+        f'<div class="label">Spørgsmål i intentionen «{esc(INTENT_LABEL.get(intent, intent))}»'
+        f" — {len(items)} i alt</div>"
+        + "".join(question_row(q, per_q) for q in items)
+        + "</div>"
+        for intent, items in by_intent.items()
+    )
+
+    chips = "".join(
+        f'<div class="intblock int-{esc(intent)}">'
+        f'<div class="label" style="margin-top:14px">Butikker</div>'
+        f'<div class="chips">'
+        + "".join(
+            f'<span class="chip">{esc(n)}</span>'
+            for n in display_names(result, result["by_intent"][intent]["top_stores"])
         )
-        blocks.append(
-            f'<div class="q-group"><h3 class="q-group-head">{esc(intent)}'
-            f'<span class="q-count">{len(items)} spørgsmål</span></h3>'
-            f"<ul class=\"q-list\">{rows}</ul></div>"
+        + '</div><div class="label">Mærker</div><div class="chips">'
+        + "".join(
+            f'<span class="chip">{esc(n)}</span>'
+            for n in display_names(result, result["by_intent"][intent]["top_brands"])
         )
-    return "".join(blocks)
+        + "</div></div>"
+        for intent in by_intent
+    )
 
-
-def question_explorer(result: dict, answers: list[dict]) -> str:
-    grouped: dict[str, list[dict]] = {}
-    for answer in answers:
-        grouped.setdefault(answer["prompt_id"], []).append(answer)
-    for items in grouped.values():
-        items.sort(key=lambda a: (CELL_ORDER.index(f"{a['model_key']}/{a['condition']}"), a["pass"]))
-
-    payload = {
-        "cellOrder": CELL_ORDER,
-        "cellLabels": {k: list(v) for k, v in CELL_LABELS.items()},
-        "questions": {q["id"]: q for q in result["questions"]},
-        "answers": {
-            qid: [
-                {
-                    "cell": f"{a['model_key']}/{a['condition']}",
-                    "pass": a["pass"],
-                    "text": a["text"],
-                    "entities": a["entities"],
-                }
-                for a in items
-            ]
-            for qid, items in grouped.items()
-        },
-    }
-    blob = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    panels = "".join(
+        question_panel(q, per_q, n_runs) for q in result["questions"]
+    )
 
     return f"""
-<h2 id="register">Spørgsmålsregister</h2>
-<p>Alle {esc(len(result["questions"]))} spørgsmål og alle {esc(len(answers))} svar i fuld
-længde. Vælg et spørgsmål for at se, hvad hver celle svarede, hvilke entiteter der
-optrådte i hvilke kørsler, og den uredigerede tekst bag tallene.</p>
-<p class="footnote"><strong>Ét spørgsmål er tre svar per celle.</strong> Derfor står der
-tællinger — «2 af 3 kørsler» — og aldrig procenter på dette niveau. En procent på tre
-observationer er et decimaltal, der udgiver sig for at være en måling.</p>
+<section class="window plain" id="spoergsmaal">
+  <div class="wtop">
+    <h2>Spørgsmålene</h2>
+    <div class="r">Alle {esc(meta['questions'])} spørgsmål er gengivet ordret ·
+      klik for at se hvad hver celle svarede</div>
+  </div>
+  <p class="stand" style="margin-bottom:26px">De {esc(meta['questions'])} spørgsmål er den
+    svageste antagelse i hele arbejdet. Derfor ligger de her og ikke i et bilag: man skal
+    kunne være konkret uenig i dem — og se de {esc(per_q)} svar, hvert af dem gav.</p>
+  <div class="intents">{tiles}</div>
+  <div class="tickkey">
+    <span><i></i> ét felt pr. spørgsmål · ordlyd og alle {esc(per_q)} svar ligger i
+      rapporten</span>
+    <span><i class="err"></i> spørgsmål, hvor mindst ét svar anbefalede en kæde, der ikke
+      findes ({esc(n_err)} af {esc(meta['questions'])})</span>
+  </div>
+  <div class="qsplit">
+    <div>
+      {lists}
+      <p class="small" style="margin-top:18px">Der står ingen procenter pr. spørgsmål
+        nogen steder i rapporten. Ét spørgsmål er {esc(n_runs)} svar pr. celle, og en
+        procent på {esc(n_runs)} svar er et decimaltal, der udgiver sig for at være en
+        måling. Spørgsmålsniveauet opgøres i tællinger.</p>
+    </div>
+    <div>
+      <div class="label">Entiteter der optrådte oftest i denne intention</div>
+      {chips}
+      <p class="small">Kvalitativ liste, med vilje uden tal. Butikker og mærker står i to
+        lister og lægges aldrig sammen: et prisspørgsmål kan fremkalde en butikskæde, et
+        smagsspørgsmål kan ikke.</p>
+    </div>
+  </div>
+  {panels}
+</section>
+"""
 
-<div class="explorer" id="explorer">
-  <div class="q-register">{question_register(result)}</div>
-  <div class="q-detail" id="q-detail" aria-live="polite"></div>
+
+def intent_tile(intent: str, items: list[dict], per_q: int) -> str:
+    """One tile per intention. The tick row is one tick per question.
+
+    In the prototype a green tick meant «the wording is reproduced in the report»
+    and only three were green. All of them are green now, because every question
+    carries its full wording and all twelve answers. The ticks that mark a
+    factual error are the ones worth looking at, so those get the outline.
+    """
+    ticks = "".join(
+        '<i class="doc'
+        + (" err" if any(c.get("defunct_errors") for c in q["cells"].values()) else "")
+        + '"></i>'
+        for q in items
+    )
+    return (
+        f'<button class="itile" type="button" data-int="{esc(intent)}" aria-pressed="false">'
+        f'<div class="n">{esc(INTENT_LABEL.get(intent, intent))}</div>'
+        f'<div class="q">{len(items)}</div>'
+        f'<div class="u">spørgsmål · {len(items) * per_q} svar</div>'
+        f'<div class="ticks">{ticks}</div></button>'
+    )
+
+
+def question_row(question: dict, per_q: int) -> str:
+    errors = sum(c.get("defunct_errors", 0) for c in question["cells"].values())
+    flag = (
+        f'<span class="qflag">lukket kæde<br>{errors} af {per_q} svar</span>'
+        if errors else '<span class="qflag"></span>'
+    )
+    return (
+        f'<button class="qrow" type="button" data-q="{esc(question["id"])}" '
+        f'aria-expanded="false">'
+        f'<span class="id">{esc(question["id"])}</span>'
+        f'<span class="tx">{esc(question["text"])}</span>{flag}</button>'
+    )
+
+
+def question_panel(question: dict, per_q: int, n_runs: int) -> str:
+    cols = []
+    for cell in CELL_ORDER:
+        data = question["cells"].get(cell)
+        model, condition = CELL_LABELS.get(cell, (cell, ""))
+        if data is None:
+            cols.append(
+                f'<div class="qcell"><div class="qcell-head">{esc(model)}'
+                f"<em>{esc(condition)}</em></div>"
+                f'<p class="qnone">Cellen indgår i målingen, men payloaden er ikke '
+                f"leveret for dette spørgsmål.</p></div>"
+            )
+            continue
+        if data["entities"]:
+            ents = "".join(
+                f'<li><span class="en">{esc(e["display"])}</span>'
+                f'<span class="et">{esc(TYPE_SINGULAR.get(e["type"], e["type"]))}</span>'
+                f'<span class="ec">'
+                + "".join(
+                    f'<i class="{"on" if i < e["runs_present"] else ""}"></i>'
+                    for i in range(e["runs_total"])
+                )
+                + f'{e["runs_present"]} af {e["runs_total"]}</span></li>'
+                for e in data["entities"]
+            )
+            body = f'<ul class="qents">{ents}</ul>'
+        else:
+            body = (
+                '<p class="qnone">Ingen mærker eller butikker registreret i denne '
+                "celle.</p>"
+            )
+        flag = (
+            f'<p class="qerr">{data["defunct_errors"]} af {data["runs"]} kørsler '
+            f"anbefalede en kæde, der ikke findes</p>"
+            if data.get("defunct_errors") else ""
+        )
+        runs = "".join(
+            f'<button type="button" class="qrun" data-q="{esc(question["id"])}" '
+            f'data-cell="{esc(cell)}" data-pass="{i}">kørsel {i}</button>'
+            for i in range(1, n_runs + 1)
+        )
+        cols.append(
+            f'<div class="qcell"><div class="qcell-head">{esc(model)}'
+            f"<em>{esc(condition)}</em></div>{body}{flag}"
+            f'<div class="qmeta">median {data["median_length"]} tegn</div>'
+            f'<div class="qruns noprint">{runs}</div></div>'
+        )
+
+    return f"""
+<div class="detail qpanel" id="p-{esc(question['id'])}" hidden>
+  <div class="label">Spørgsmål {esc(question['id'])} · intention
+    «{esc(INTENT_LABEL.get(question['intent'], question['intent']))}» ·
+    {esc(per_q)} svar</div>
+  <p class="verbatim">{esc(question['text'])}</p>
+  <div class="qcells">{''.join(cols)}</div>
+  <div class="tslot"></div>
+  <p class="small" style="max-width:36em;margin:14px 0 0">Tallene er tællinger, ikke
+    procenter: «{esc(n_runs)} af {esc(n_runs)} kørsler» betyder, at entiteten optrådte i
+    alle {esc(n_runs)} svar fra den celle. Transkripterne er modellens ord og modellens
+    påstande om navngivne virksomheder — ikke rapportens, og ikke efterprøvet mod en
+    butikshylde.</p>
 </div>
-<p class="footnote noprint">Transkripterne er modellernes ord, ikke mine. De indeholder
-modellernes egne påstande om navngivne virksomheders priser og kvalitet, gengivet
-uredigeret, fordi det er grundlaget for tallene ovenfor.</p>
+"""
 
-<script type="application/json" id="qdata">{blob}</script>
-<script>
-(function () {{
-  var el = document.getElementById('qdata');
-  if (!el) return;
-  var D = JSON.parse(el.textContent);
-  var detail = document.getElementById('q-detail');
 
-  function esc(s) {{
-    return String(s).replace(/[&<>"]/g, function (c) {{
-      return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c];
-    }});
-  }}
+# --- Section 3: the four cells -----------------------------------------------
 
-  // Transcripts are shown as transcripts: whitespace preserved, **bold**
-  // honoured, nothing else interpreted. A half-working markdown renderer
-  // would quietly misrepresent the evidence.
-  function transcript(text) {{
-    return esc(text).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  }}
 
-  function dots(present, total) {{
-    var out = '';
-    for (var i = 0; i < total; i++) {{
-      out += '<span class="dot' + (i < present ? ' on' : '') + '"></span>';
-    }}
-    return '<span class="dots">' + out + '</span>';
-  }}
+def matrix_section(result: dict, brands: dict, shops: dict) -> str:
+    tables = "".join(matrix_table(result, fam) for fam in (brands, shops))
+    return f"""
+<section class="window dark" id="celler">
+  <div class="wtop">
+    <h2>Fire celler, samme entiteter</h2>
+    <div class="r">Alle fire celler vises altid · ingen knap lægger dem sammen</div>
+  </div>
+  <div class="pills noprint" style="margin-bottom:26px">
+    <button class="pill" type="button" data-fam="brands" aria-pressed="true">Mærker</button>
+    <button class="pill" type="button" data-fam="shops" aria-pressed="false">Butikker</button>
+  </div>
+  {tables}
+  <div class="keys">
+    <div><span class="k v"></span> synlig, over 40&nbsp;%</div>
+    <div><span class="k m"></span> marginal, 10–40&nbsp;%</div>
+    <div><span class="k u"></span> usynlig, under 10&nbsp;%</div>
+    <div><span class="k r"></span> 95&nbsp;%-Wilson-interval, n = {esc(result['meta']['questions'])} spørgsmål</div>
+    <div><span class="k o"></span> optrådte oftest i den valgte intention</div>
+    <div><span class="kd">{esc(config.BOUNDARY_MARKER)}</span> intervallet krydser en
+      båndgrænse — båndet er ikke afgjort</div>
+  </div>
+  <p class="small" style="margin-top:22px">Farven bærer størrelsen: lilla er synlig,
+    orange er marginal, lys er under 10&nbsp;%. Ingen entitet nedtones eller skjules —
+    også et mærke, der blev nævnt én enkelt gang, står i fuld læsbarhed, for det er
+    tallet, en marketingchef er kommet for at se. Rækkefølgen er ikke en rangorden: entiteterne er grupperet i
+    bånd, og inden for et bånd er intervallerne så brede, at en placering ville være
+    opdigtet præcision. Den lyse flade bag hver bjælke er 95&nbsp;%-intervallet. Mærker
+    og butikker har hver sin akse og vises aldrig i samme graf.</p>
+</section>
+"""
 
-  function render(qid) {{
-    var q = D.questions[qid];
-    if (!q) return;
-    var answers = D.answers[qid] || [];
 
-    var cols = D.cellOrder.map(function (cell) {{
-      var c = q.cells[cell];
-      var label = D.cellLabels[cell] || [cell, ''];
-      if (!c) return '';
-      var body;
-      if (!c.entities.length) {{
-        body = '<p class="q-none">Ingen mærker eller butikker registreret i denne celle.</p>';
-      }} else {{
-        body = '<ul class="q-ents">' + c.entities.map(function (e) {{
-          return '<li><span class="q-ent-name">' + esc(e.display) + '</span>' +
-                 '<span class="q-ent-type">' + esc(e.type) + '</span>' +
-                 dots(e.runs_present, e.runs_total) + '</li>';
-        }}).join('') + '</ul>';
-      }}
-      var flag = c.defunct_errors
-        ? '<p class="q-flag">' + c.defunct_errors + ' af ' + c.runs +
-          ' kørsler anbefalede en udgået kæde</p>'
-        : '';
-      var runs = answers.filter(function (a) {{ return a.cell === cell; }})
-        .map(function (a) {{
-          return '<button type="button" class="q-run" data-q="' + esc(qid) +
-                 '" data-cell="' + esc(cell) + '" data-pass="' + a.pass + '">kørsel ' + a.pass + '</button>';
-        }}).join('');
-      return '<div class="q-cell"><div class="q-cell-head">' + esc(label[0]) +
-             '<em>' + esc(label[1]) + '</em></div>' + body + flag +
-             '<div class="q-runs">' + runs + '</div></div>';
-    }}).join('');
+def matrix_table(result: dict, fam: dict) -> str:
+    axis = fam["axis"]
+    cells = fam["cells"]
+    intents = result["by_intent"]
+    top_key = "top_brands" if fam["type"] == "maerke" else "top_stores"
 
-    detail.innerHTML =
-      '<div class="q-detail-head"><span class="q-id">' + esc(qid) + '</span>' +
-      '<span class="q-intent">' + esc(q.intent) + '</span></div>' +
-      '<p class="q-question">' + esc(q.text) + '</p>' +
-      '<p class="q-meta">4 celler × 3 kørsler = 12 svar · tællinger, ikke procenter</p>' +
-      '<div class="q-cells">' + cols + '</div>' +
-      '<div id="q-transcript"></div>';
+    head = (
+        f'<thead><tr><th>{esc(fam["label"])}<span>Omtale-rate pr. celle</span></th>'
+        + "".join(
+            f'<th class="cellcol">{esc(CELL_LABELS[c][1])}<span>{esc(CELL_LABELS[c][0])}</span></th>'
+            for c in cells
+        )
+        + "</tr></thead>"
+    )
 
-    document.querySelectorAll('.q-item').forEach(function (b) {{
-      b.classList.toggle('active', b.dataset.q === qid);
-    }});
-  }}
+    body, current_band = [], None
+    for data in fam["rows"]:
+        if data["_band"] != current_band:
+            current_band = data["_band"]
+            count = sum(1 for d in fam["rows"] if d["_band"] == current_band)
+            copy = {
+                "synlig": "synlig i mindst én celle · over 40&nbsp;%",
+                "marginal": "marginal i sit bedste tilfælde · 10–40&nbsp;%",
+                "usynlig": "under 10&nbsp;% i alle fire celler",
+            }[current_band]
+            body.append(
+                f'<tr class="grp"><td colspan="{len(cells) + 1}">'
+                f'<span class="grp-dot {band_class(current_band)}"></span>'
+                f"{copy} · {count} {esc(fam['label'].lower())}</td></tr>"
+            )
 
-  function showTranscript(qid, cell, pass) {{
-    var a = (D.answers[qid] || []).filter(function (x) {{
-      return x.cell === cell && x.pass === Number(pass);
-    }})[0];
-    var box = document.getElementById('q-transcript');
-    if (!a || !box) return;
-    var label = D.cellLabels[cell] || [cell, ''];
-    box.innerHTML =
-      '<div class="tr"><div class="tr-head">Transkript · ' + esc(label[0]) + ' ' +
-      esc(label[1]) + ' · kørsel ' + esc(pass) + ' · uredigeret' +
-      '<button type="button" class="tr-close">luk</button></div>' +
-      '<div class="tr-body"><span class="tr-attr">Modellens ord, ikke mine</span>' +
-      '<div class="tr-text">' + transcript(a.text) + '</div></div></div>';
-    box.scrollIntoView({{behavior: 'smooth', block: 'nearest'}});
-  }}
+        note = f'<i>{esc(data["note"])}</i>' if data["note"] else ""
+        if data["defunct"]:
+            chain = result["defunct"]["chains"].get(data["key"], {})
+            note += f'<i class="gone">ophørte {esc(chain.get("ended", ""))}</i>'
+        marks = "".join(
+            f'<span class="mark" data-int="{esc(intent)}"><b></b>oftest i '
+            f"«{esc(INTENT_LABEL.get(intent, intent))}»</span>"
+            for intent, idata in intents.items()
+            if data["key"] in idata[top_key]
+        )
 
-  document.addEventListener('click', function (ev) {{
-    var item = ev.target.closest('.q-item');
-    if (item) {{ render(item.dataset.q); return; }}
-    var run = ev.target.closest('.q-run');
-    if (run) {{ showTranscript(run.dataset.q, run.dataset.cell, run.dataset.pass); return; }}
-    if (ev.target.closest('.tr-close')) {{
-      document.getElementById('q-transcript').innerHTML = '';
-    }}
-  }});
+        tds = []
+        for cell in cells:
+            stat = data["cells"][cell]
+            rate, low, high = stat["mention_rate"], stat["ci_low"], stat["ci_high"]
+            klass = band_class(stat["band"])
+            dagger = (
+                f'<u>{esc(config.BOUNDARY_MARKER)}</u>' if stat["boundary_uncertain"] else ""
+            )
+            tds.append(
+                f'<td class="cellcol">'
+                f'<div class="track" title="{esc(stat["band"])}">'
+                f'<div class="rng" style="left:{low / axis * 100:.1f}%;'
+                f'width:{max(0.0, (min(axis, high) - low) / axis * 100):.1f}%"></div>'
+                f'<div class="bar {klass}{" seen" if stat["mentions"] else ""}" '
+                f'style="width:{rate / axis * 100:.1f}%"></div></div>'
+                f'<div class="num {klass}">{pct(rate)}{dagger}'
+                f'<s>{pct(low).replace("&nbsp;%", "")}–{pct(high)}</s></div>'
+                f'<div class="band">{esc(stat["band"])}</div></td>'
+            )
 
-  var first = document.querySelector('.q-item');
-  if (first) render(first.dataset.q);
-}})();
-</script>
+        body.append(
+            f'<tr><td class="name">{esc(data["display"])}{note}{marks}</td>'
+            + "".join(tds)
+            + "</tr>"
+        )
+
+    never = ""
+    if fam["never"]:
+        never = (
+            f'<p class="small" style="margin:16px 0 0">Aldrig nævnt i nogen af de '
+            f'{esc(result["meta"]["answers"])} svar, men med i ordbogen: '
+            f'{esc(", ".join(fam["never"]))}. En entitet med nul omtaler har ingen '
+            f"bjælke — den har en linje her.</p>"
+        )
+
+    toplines = topline_strip(result, fam)
+
+    return (
+        f'<div class="famblock fam-{fam["fam"]}">'
+        f'<h3 class="famhead">{esc(fam["label"])} · akse 0–{pct(axis)} · '
+        f'{len(fam["rows"])} entiteter</h3>'
+        f"{toplines}"
+        f'<div class="mwrap"><table class="m">{head}<tbody>{"".join(body)}</tbody></table></div>'
+        f"{never}</div>"
+    )
+
+
+def topline_strip(result: dict, fam: dict) -> str:
+    """Per-cell coverage for one family. Four figures, never one."""
+    share_key = "share_with_brand" if fam["type"] == "maerke" else "share_with_store"
+    avg_key = "avg_brands_per_answer" if fam["type"] == "maerke" else "avg_stores_per_answer"
+    word = "mærke" if fam["type"] == "maerke" else "butik"
+    plural = "mærker" if fam["type"] == "maerke" else "butikker"
+
+    blocks = "".join(
+        f'<div class="tl"><div class="tl-c">{esc(CELL_LABELS[c][0])} '
+        f'<em>{esc(CELL_LABELS[c][1])}</em></div>'
+        f'<div class="tl-v">{pct(result["toplines"][c][share_key])}</div>'
+        f'<div class="tl-s">af {result["toplines"][c]["answers"]} svar nævner mindst ét '
+        f'{esc(word)} · {dec(result["toplines"][c][avg_key], 2)} {esc(plural)} pr. svar</div></div>'
+        for c in fam["cells"]
+    )
+    return f'<div class="tls">{blocks}</div>'
+
+
+# --- Section 4: defunct chains and disagreement ------------------------------
+
+
+def quote_html(quote: str, chain: str) -> str:
+    """An excerpt from a raw answer, set as the model's own words.
+
+    Two things are preserved on purpose: the markdown emphasis the model wrote
+    (so the quote reads as it was written), and the name of the chain that no
+    longer exists (marked, because it is the finding — not a typo).
+    """
+    text = quote.strip()
+    text = re.sub(r"^…\S*\s*", "… ", text)  # excerpts start mid-word; cut to a word
+    text = re.sub(r"#{1,6}\s*", "", text)
+    text = re.sub(r"\s+", " ", text)
+    out = esc(text)
+    out = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", out)
+    out = re.sub(r"\*([^*]+)\*", r"<i>\1</i>", out)
+    if chain:
+        out = re.sub(
+            rf"\b({re.escape(esc(chain))})\b",
+            r'<mark class="gone">\1</mark>',
+            out,
+        )
+    return out
+
+
+def defunct_section(result: dict) -> str:
+    defunct = result["defunct"]
+    chains = defunct["chains"]
+    per_cell = defunct["per_cell"]
+    total = sum(c["answers_with_error"] for c in per_cell.values())
+
+    chain_list = "".join(
+        f'<div class="gonerow"><div class="a">{esc(c["display"])}</div>'
+        f'<div class="b">ophørt {esc(c["ended"])}</div>'
+        f'<div class="c">{esc(c["detail"])}</div></div>'
+        for c in chains.values()
+    )
+
+    rows = "".join(
+        f"<tr><td>{esc(cell_name(cell))}</td>"
+        f'<td>{stats["answers_with_error"]} af {stats["answers"]}</td>'
+        f'<td>{pct(stats["error_rate"])}</td>'
+        f'<td>{stats["answers_stating_closure_correctly"]}</td>'
+        f'<td class="txt">'
+        + (
+            esc(" · ".join(f"{n} {v}" for n, v in stats["by_chain"].items()))
+            if stats["by_chain"] else "—"
+        )
+        + "</td></tr>"
+        for cell, stats in sorted(
+            per_cell.items(),
+            key=lambda kv: CELL_ORDER.index(kv[0]) if kv[0] in CELL_ORDER else 99,
+        )
+    )
+
+    if total == 0:
+        body = (
+            "<p><strong>Ingen af modellerne anbefalede en udgået kæde i denne "
+            "måling.</strong> Sektionen står alligevel, fordi tjekket er en del af "
+            "metoden og ikke af resultatet.</p>"
+        )
+    else:
+        quotes = "".join(
+            f'<div class="quote"><p>«{quote_html(q["quote"], q.get("chain", ""))}»</p>'
+            f'<div class="src">{esc(cell_name(q["cell"]))} · kørsel {esc(q["pass"])} · '
+            f'spørgsmål {esc(q["prompt_id"])}: «{esc(q["question"])}» — modellens ord, '
+            f"ikke rapportens</div></div>"
+            for q in defunct["quotes"][:3]
+        )
+        body = (
+            f'<table class="t">'
+            f"<thead><tr><th>Celle</th><th>Svar med fejl</th><th>Andel</th>"
+            f'<th>Svar der beskriver lukningen korrekt</th>'
+            f'<th class="txt">Hvilke kæder</th></tr></thead>'
+            f"<tbody>{rows}</tbody></table>"
+            f'<p class="small" style="margin-top:14px">En omtale tælles kun som fejl, '
+            f"hvis den står uden en lukningsmarkør i nærheden. «Aldi forlod Danmark i "
+            f"2023» er modellen, der har ret, og tælles ikke med. "
+            f'{len(defunct["quotes"])} passager blev fanget i alt; tre af dem står her, '
+            f"ordret:</p>{quotes}"
+        )
+
+    dis_rows = "".join(
+        f"<tr><td>{'Uden' if key == 'nosearch' else 'Med'} websøgning</td>"
+        f'<td>{dec(data["jaccard"])}</td>'
+        f'<td>{len(data["shared"])} navne</td>'
+        f'<td class="txt">Kun {CELL_LABELS[data["cells"][0]][0]}: '
+        f'{esc(", ".join(data["only_in_claude"]) or "ingen")}. '
+        f'Kun {CELL_LABELS[data["cells"][1]][0]}: '
+        f'{esc(", ".join(data["only_in_gpt"]) or "ingen")}.</td></tr>'
+        for key, data in result["disagreement"].items()
+    )
+
+    return f"""
+<section class="window plain" id="kaeder">
+  <h2>Kæder, der ikke findes</h2>
+  <p class="stand" style="margin-bottom:22px">Tre danske dagligvarekæder findes ikke
+    længere. Anbefales de stadig, uden at lukningen nævnes, er det ikke en smagssag, men
+    faktuelt forkert købsråd leveret med samme sikkerhed som det rigtige.</p>
+  <div class="gonelist">{chain_list}</div>
+  {body}
+  <h3>Enigheden falder, når modellerne får adgang til nutiden</h3>
+  <p>Overlappet er beregnet inden for hver betingelse. At sammenligne en søgende model
+    med en ikke-søgende ville måle indstillingen, ikke modellerne.</p>
+  <table class="t">
+    <thead><tr><th>Betingelse</th><th>Jaccard-overlap</th><th>Fælles navne</th>
+      <th class="txt">Hvem står alene</th></tr></thead>
+    <tbody>{dis_rows}</tbody>
+  </table>
+  <p class="small" style="margin-top:14px">Et lavt overlap betyder, at hvilken model
+    forbrugeren tilfældigvis bruger, afgør hvilke navne de præsenteres for.</p>
+</section>
+"""
+
+
+# --- Section 5: limitations ---------------------------------------------------
+
+LIMITATIONS = [
+    (
+        "Volumen",
+        "Målingen siger intet om, hvor mange danskere der faktisk spørger en sprogmodel "
+        "til råds, før de handler ind. Tallet kan være lille. Der findes ingen offentligt "
+        "tilgængelig kilde, jeg kan reproducere, og betalte data er bevidst udeladt: et "
+        "arbejde, hvis pointe er efterprøvelighed, kan ikke hvile på et tal, læseren ikke "
+        "kan efterprøve.",
+    ),
+    (
+        "Årsag",
+        "Rapporten viser, hvad modellerne svarer — ikke hvorfor. Om en entitet nævnes "
+        "ofte, fordi den er markedsledende, fordi den fylder i træningsdata, eller fordi "
+        "den står i de kilder en søgning tilfældigvis rammer, kan metoden ikke afgøre.",
+    ),
+    (
+        "Konvertering",
+        "At blive nævnt er ikke at blive købt. Intet i materialet forbinder en omtale med "
+        "et salg, et butiksbesøg eller et klik.",
+    ),
+    (
+        "Udløb",
+        "Det er et øjebliksbillede. Modeller opdateres uden varsel, søgeindekser ændrer "
+        "sig dagligt, og udbydernes standardindstillinger skifter. Samme kørsel om tre "
+        "måneder ville give andre tal — og man kunne ikke vide, om forskellen kom fra "
+        "markedet eller fra modellen. Derfor står udløbsdatoen på forsiden.",
+    ),
+    (
+        "Repræsentativitet",
+        "Spørgsmålene er skrevet af én person. Ingen test kan afgøre, om de svarer til, "
+        "hvordan danskere faktisk spørger. Derfor ligger de i afsnit 2 og ikke i et bilag, "
+        "og derfor ligger hvert enkelt svar bag dem.",
+    ),
+    (
+        "Hvad rapporten ikke gør",
+        "Den giver ingen anbefalinger til navngivne virksomheder. Citaterne er modellens "
+        "ord og modellens påstande om navngivne virksomheders priser — ikke rapportens, og "
+        "ikke verificeret mod butikshylder. Rapporten viser en blind vinkel og stopper der.",
+    ),
+]
+
+
+def limitations_section() -> str:
+    half = (len(LIMITATIONS) + 1) // 2
+    columns = []
+    for start, chunk in ((0, LIMITATIONS[:half]), (half, LIMITATIONS[half:])):
+        items = "".join(
+            f'<div class="lim"><div class="n">5.{start + i + 1}</div>'
+            f"<h4>{esc(title)}</h4><p>{esc(text)}</p></div>"
+            for i, (title, text) in enumerate(chunk)
+        )
+        columns.append(f"<div>{items}</div>")
+    return f"""
+<section class="window purple" id="forbehold">
+  <div class="wtop">
+    <h2>Hvad målingen ikke kan sige</h2>
+    <div class="r">Står i rapportens brødtekst, ikke i en fodnote</div>
+  </div>
+  <p class="stand" style="margin-bottom:8px">Rapportens form er stram. Det gør ikke
+    datagrundlaget stærkere, end det er. Seks forbehold, som ingen præsentation kan
+    fjerne.</p>
+  <div class="lims">{''.join(columns)}</div>
+</section>
+"""
+
+
+# --- Section 6: method --------------------------------------------------------
+
+
+def method_section(result: dict) -> str:
+    meta = result["meta"]
+    intents = result["by_intent"]
+    intent_text = ", ".join(
+        f"{INTENT_LABEL.get(k, k)} ({v['questions']})" for k, v in intents.items()
+    )
+    models = ", ".join(meta["models"].values())
+    spans = " · ".join(
+        f"kørsel {s['pass']}: {s['first'][11:16]}–{s['last'][11:16]} UTC"
+        for s in meta["pass_spans"]
+    )
+    spaced = len(meta["passes"]) > 1
+    consistency_note = (
+        "Kørslerne ligger timer fra hinanden, så konsistenstallet også afspejler "
+        "variation over tid — ikke kun modellens tilfældighed i det enkelte kald."
+        if spaced else
+        "Kørslerne blev foretaget i træk, så konsistenstallet afspejler modellens "
+        "tilfældighed i det enkelte kald, ikke variation over tid."
+    )
+    unknown = "".join(
+        f'<span class="chip">{esc(u["name"])} <s>{u["count"]}</s></span>'
+        for u in result["unknown_names"][:14]
+    )
+    n_cells = len(meta["cells"])
+    n_runs = len(meta["passes"])
+    per_cell = meta["cell_sizes"][CELL_ORDER[0]]
+
+    truncated = (
+        f"{meta['truncated_answers']} svar var afkortet af udbyderens tokengrænse og er "
+        f"talt med som det, der nåede frem."
+        if meta["truncated_answers"] else "Ingen svar blev afkortet."
+    )
+
+    return f"""
+<section class="window plain" id="metode">
+  <h2>Metode</h2>
+  <h3>Spørgsmålene</h3>
+  <p>{esc(meta['questions'])} spørgsmål på dansk fordelt på fem intentioner:
+    {esc(intent_text)}. Ingen af dem indeholder et mærke- eller butiksnavn — et spørgsmål
+    med «Arla» i ville måle genkendelse, ikke synlighed. Det håndhæves af en test i
+    pipelinen, ikke af disciplin.</p>
+  <h3>Design</h3>
+  <p>{esc(n_cells)} celler: to modeller × to betingelser (uden og med websøgning). Hver
+    celle kørt {esc(n_runs)} gange med timers mellemrum, så konsistens også afspejler
+    variation over tid og ikke kun modellens tilfældighed i det enkelte kald.
+    {esc(n_cells)} × {esc(meta['questions'])} × {esc(n_runs)} =
+    {esc(meta['answers'])} svar, {esc(per_cell)} pr. celle. Tidsrum: {esc(spans)}.
+    {esc(truncated)}</p>
+  <h3>Modeller og indstillinger</h3>
+  <p>{esc(models)}. Ingen systemprompt, udbyderens øvrige standardindstillinger.
+    Standardindstillinger er ikke det samme på tværs af udbydere — den ene model tænker
+    som standard. Forskelle mellem modellerne er derfor delvis forskelle mellem
+    udbydernes defaults, og det er en grænse for, hvad målingen kan tilskrive.</p>
+  <h3>Ekstraktion</h3>
+  <p>Omtaler findes med ordbog og regulære udtryk. Ingen sprogmodel deltager i tællingen.
+    Ordbogen ligger i <span class="mono">entities.py</span> og kan gennemgås linje for
+    linje. Danske faldgruber er håndteret med positionelle værn: «spar penge» er ikke
+    butikskæden SPAR, «netto 400 gram» er ikke Netto, men «Netto har gode priser på 400
+    gram ost» er. Kun første forekomst pr. entitet pr. svar tælles — ellers ville et
+    langt, snakkesaligt svar veje tungere end et kort.</p>
+  <h3>Ordbogens dækning</h3>
+  <p>Efter ekstraktion udskrives kapitaliserede navne, som optrådte i svarene, men ikke
+    stod i ordbogen. Hullerne findes systematisk frem for ved gætteri. De hyppigste
+    ikke-katalogiserede navne i denne kørsel — hovedsagelig kategorier, myndigheder og
+    stednavne, som med vilje ikke er entiteter:</p>
+  <div class="chips">{unknown}</div>
+  <h3>Optælling og usikkerhed</h3>
+  <p>Omtale-rate er andelen af cellens {esc(per_cell)} svar, hvor entiteten optræder
+    mindst én gang; fem omtaler i ét svar tæller som én. Bånd: synlig over 40&nbsp;%,
+    marginal 10–40&nbsp;%, usynlig under 10&nbsp;%. Ingen placeringer, fordi intervallerne
+    på n&nbsp;=&nbsp;{esc(meta['questions'])} er brede nok til, at en rangorden ville være
+    opdigtet præcision. {esc(meta['ci_note'])} {esc(consistency_note)}</p>
+  <h3>Forudregistrering og efterprøvning</h3>
+  <p>Rapportens sektioner og båndgrænser blev låst i
+    <span class="mono">report_plan.md</span> før den fulde kørsel; git-historikken viser
+    hvornår. Spørgsmål, prompts, rå svar, optællingskode og de fire celletabeller ligger
+    samlet og tidsstemplet. Den, der vil modsige et tal her, skal kunne gøre det ved at
+    køre målingen igen.</p>
+</section>
+"""
+
+
+# --- Section 7: appendix ------------------------------------------------------
+
+
+def appendix(result: dict, brands: dict, shops: dict) -> str:
+    blocks = []
+    for fam in (brands, shops):
+        rows = []
+        for data in fam["rows"]:
+            first = True
+            for cell in fam["cells"]:
+                stat = data["cells"][cell]
+                if not stat["mentions"]:
+                    continue
+                name = (
+                    f'<td class="ent">{esc(data["display"])}</td>' if first
+                    else '<td class="ent cont"></td>'
+                )
+                first = False
+                dagger = config.BOUNDARY_MARKER if stat["boundary_uncertain"] else ""
+                rows.append(
+                    f"<tr>{name}<td>{esc(cell_name(cell))}</td>"
+                    f'<td>{stat["mentions"]} af {stat["answers"]}</td>'
+                    f'<td>{pct(stat["mention_rate"], 1)}{dagger}</td>'
+                    f'<td>{pct(stat["ci_low"], 1).replace("&nbsp;%", "")}–'
+                    f'{pct(stat["ci_high"], 1)}</td>'
+                    f'<td>{pct(stat["share_of_voice"], 1)}</td>'
+                    f'<td>{pct(stat["first_mentioned_rate"], 1)}</td>'
+                    f'<td>{pct(stat["consistency"], 1)}</td>'
+                    f'<td class="txt">{esc(stat["band"])}</td></tr>'
+                )
+        blocks.append(
+            f'<div class="famblock fam-{fam["fam"]}">'
+            f'<h3 class="famhead">{esc(fam["label"])}</h3>'
+            f'<div class="mwrap"><table class="t app">'
+            f"<thead><tr><th>Entitet</th><th>Celle</th><th>Svar med omtale</th>"
+            f"<th>Omtale-rate</th><th>95&nbsp;%-interval</th><th>Share of voice</th>"
+            f'<th>Først nævnt</th><th>Konsistens</th><th class="txt">Bånd</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div></div>'
+        )
+
+    return f"""
+<section class="window plain" id="bilag">
+  <div class="wtop">
+    <h2>Bilag: alle tal</h2>
+    <div class="r">Mærker og butikker aldrig i samme tabel · knappen deler tilstand med
+      afsnit 3</div>
+  </div>
+  <div class="pills noprint" style="margin-bottom:22px">
+    <button class="pill" type="button" data-fam="brands" aria-pressed="true">Mærker</button>
+    <button class="pill" type="button" data-fam="shops" aria-pressed="false">Butikker</button>
+  </div>
+  <p>Samme fire celler, alle mål. Share of voice er entitetens andel af alle omtaler i
+    cellen. «Først nævnt» er andelen af de svar med omtale, hvor entiteten stod først.
+    Konsistens er andelen af kørsler, hvor entiteten optrådte, blandt de spørgsmål hvor
+    den optrådte mindst én gang — en entitet med lav konsistens er ikke synlig, den er
+    heldig. Rækker uden omtaler i en celle er udeladt af den celle, ikke af tabellen.</p>
+  {''.join(blocks)}
+</section>
 """
 
 
@@ -570,171 +1067,413 @@ uredigeret, fordi det er grundlaget for tallene ovenfor.</p>
 
 CSS = """
 :root{
-  --carton:#F2EFE7; --carton-edge:#E4DFD1; --ink:#16305C; --ink-soft:#4A5F86;
-  --stamp:#C0392B; --rule:#CFC8B6; --bar:#16305C; --bar-track:#DFD9C8;
+  --white:#FEFBE6; --white100:#FFFEF6; --off60:#FAF6DD; --off40:#F3EFD5;
+  --black:#0B0B26; --blue:#372BC5; --blue60:#5C44ED;
+  --purple:#CFCEFF; --lpurple:#F7F6FF; --purple100:#9795FF;
+  --pink:#FFD6B8; --lpink:#FFEBDD; --pink100:#FCB27C;
+  --green:#55D440; --valid:#12862B; --alert:#E31F04;
+  --line:rgba(11,11,38,.22); --line8:rgba(11,11,38,.08); --ink66:rgba(11,11,38,.66);
+  --onl22:rgba(254,251,230,.22); --onl66:rgba(254,251,230,.66);
+  --font:Arial,Helvetica,"Helvetica Neue",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace;
+  --measure:724px;
 }
 *{box-sizing:border-box}
-html{color-scheme:light}
-body{
-  margin:0; padding:0; background:var(--carton); color:var(--ink);
-  font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;
-  font-size:16px; line-height:1.55;
-  -webkit-font-smoothing:antialiased;
-}
-.sheet{max-width:52rem; margin:0 auto; padding:2rem 1.25rem 5rem}
-.mono,.num,.bar-value,.tile-value{
-  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Courier New",monospace;
-  font-variant-numeric:tabular-nums;
-}
-header{border-bottom:3px solid var(--ink); padding-bottom:1.25rem; margin-bottom:2rem}
-.eyebrow{
-  font-size:.7rem; letter-spacing:.22em; text-transform:uppercase;
-  color:var(--ink-soft); margin:0 0 .75rem;
-}
-h1{font-size:1.9rem; line-height:1.2; margin:0 0 1rem; letter-spacing:-.01em}
-h2{
-  font-size:1.15rem; letter-spacing:.04em; text-transform:uppercase;
-  margin:3rem 0 .75rem; padding-top:1rem; border-top:1px solid var(--rule);
-}
-h3{font-size:1rem; margin:1.5rem 0 .4rem}
-p{margin:0 0 .9rem}
-ul{margin:0 0 .9rem; padding-left:1.2rem}
-li{margin-bottom:.3rem}
-.lede{font-size:1.05rem}
-.footnote{font-size:.82rem; color:var(--ink-soft); margin-top:.9rem}
-.note{font-size:.75rem; color:var(--ink-soft); font-style:italic}
+html{-webkit-text-size-adjust:100%;color-scheme:light}
+body{margin:0;background:var(--white);color:var(--black);font:400 16px/1.6 var(--font);
+  font-variant-numeric:tabular-nums;text-wrap:pretty;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1240px;margin:0 auto;padding:0 40px 88px}
+button{font:inherit;cursor:pointer;background:transparent;color:inherit;border:0}
+p{margin:0 0 14px;max-width:var(--measure)}
+a{color:var(--blue)}a:hover{color:var(--blue60)}
+.mono{font-family:var(--mono);font-size:.92em}
+:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.window.dark :focus-visible{outline-color:var(--green)}
 
-/* Mindst holdbar til — the signature element */
-.stamp{
-  display:inline-block; border:2px solid var(--stamp); color:var(--stamp);
-  padding:.5rem .8rem; transform:rotate(-2deg); margin:1rem 0;
-  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-}
-.stamp-label{font-size:.62rem; letter-spacing:.18em; text-transform:uppercase; display:block}
-.stamp-date{font-size:1.25rem; font-weight:700; letter-spacing:.06em; display:block}
+h1{font:400 clamp(38px,6.4vw,76px)/1.04 var(--font);letter-spacing:-.028em;margin:0 0 28px;max-width:17em}
+h1 em{font-style:normal;color:var(--blue)}
+h2{font:400 clamp(26px,3.2vw,40px)/1.12 var(--font);letter-spacing:-.022em;margin:0 0 20px;max-width:24em}
+h3{font:400 22px/1.28 var(--font);letter-spacing:-.012em;margin:30px 0 8px;max-width:22em}
+.stand{font:400 clamp(19px,1.9vw,24px)/1.42 var(--font);letter-spacing:-.008em;max-width:var(--measure)}
+.small{font-size:13px;line-height:1.6;color:var(--ink66);max-width:var(--measure)}
+.label{font:400 13px/1.4 var(--font);color:var(--ink66)}
 
-.tiles{display:grid; grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr)); gap:.75rem; margin:1rem 0 1.5rem}
-.tile{border:1px solid var(--rule); background:rgba(255,255,255,.45); padding:.75rem}
-.tile-label{font-size:.68rem; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-soft)}
-.tile-value{font-size:1.7rem; line-height:1.1; margin:.2rem 0}
-.tile-sub{font-size:.74rem; color:var(--ink-soft)}
+.top{display:flex;flex-wrap:wrap;gap:8px 32px;align-items:baseline;padding:20px 0 16px}
+.top .r{margin-left:auto}
+.top span{font:400 13px/1.4 var(--font);color:var(--ink66)}
+.top b{font-weight:400;color:var(--black)}
 
-.chart{margin:1.25rem 0}
-.entity{margin-bottom:1.1rem; page-break-inside:avoid}
-.entity-name{font-weight:700; font-size:.95rem; margin-bottom:.3rem}
-.bar-row{display:grid; grid-template-columns:8.5rem 1fr 3.2rem; align-items:center; gap:.5rem; margin-bottom:2px}
-.bar-label{font-size:.72rem; color:var(--ink-soft); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
-.bar-label em{font-style:normal; opacity:.75}
-.bar-track{background:var(--bar-track); height:11px; display:block; position:relative}
-.bar-fill{background:var(--bar); height:11px; display:block; min-width:1px}
-.bar-value{font-size:.76rem; text-align:right}
+.aurora{height:132px;border-radius:32px;margin:0 0 40px;
+  background:linear-gradient(104deg,var(--green) 0%,#2FBF8C 22%,#2E7BE8 48%,var(--blue) 72%,#1A0E7A 100%)}
 
-.scroll{overflow-x:auto; -webkit-overflow-scrolling:touch; margin:1rem 0}
-table{border-collapse:collapse; width:100%; font-size:.82rem; min-width:34rem}
-th,td{text-align:left; padding:.4rem .55rem; border-bottom:1px solid var(--rule); vertical-align:top}
-th{font-size:.68rem; letter-spacing:.09em; text-transform:uppercase; color:var(--ink-soft); font-weight:600}
-td.num,th.num{text-align:right; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric:tabular-nums}
-td em{font-style:normal; color:var(--ink-soft)}
+.hero{display:grid;grid-template-columns:1fr 300px;gap:56px;padding:0 0 44px}
+.stampbox{border:1px solid var(--black);border-radius:24px;padding:22px 22px 20px}
+.stampbox .a{font:400 13px/1.4 var(--font);color:var(--ink66)}
+.stampbox .b{font:400 40px/1.05 var(--font);letter-spacing:-.03em;color:var(--alert);margin:8px 0}
+.stampbox .c{font:400 14px/1.45 var(--font)}
+.facts{margin-top:24px;border-top:1px solid var(--line);padding-top:16px}
+.facts dl{display:grid;grid-template-columns:auto 1fr;gap:6px 16px;margin:0;font-size:14px}
+.facts dt{color:var(--ink66)}
+.facts dd{margin:0}
 
-.alarm-heading{color:var(--stamp); border-top-color:var(--stamp)}
-blockquote{
-  margin:.75rem 0; padding:.7rem .9rem; border-left:3px solid var(--stamp);
-  background:rgba(255,255,255,.5); font-size:.9rem;
-}
-blockquote cite{display:block; margin-top:.5rem; font-style:normal; font-size:.74rem; color:var(--ink-soft)}
+.window{border-radius:32px;padding:32px 34px 34px;margin:0 0 24px}
+.window.plain{background:var(--white100);border:1px solid var(--line8)}
+.window.lpurple{background:var(--lpurple)}
+.window.purple{background:var(--purple)}
+.window.dark{background:var(--black);color:var(--white)}
+.window.dark h2,.window.dark h3{color:var(--white)}
+.window.dark p,.window.dark .small{color:var(--onl66)}
+.wtop{display:flex;flex-wrap:wrap;gap:10px 28px;align-items:baseline;margin-bottom:22px}
+.wtop h2{margin:0}
+.wtop .r{margin-left:auto;font:400 13px/1.4 var(--font);color:var(--ink66);max-width:34em}
+.window.dark .wtop .r{color:var(--onl66)}
 
-footer{margin-top:3.5rem; padding-top:1rem; border-top:1px solid var(--rule); font-size:.78rem; color:var(--ink-soft)}
+/* 1 · kort fortalt */
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.card{background:var(--white100);border-radius:24px;padding:24px 24px 26px;min-width:0}
+.card.accent{background:var(--purple)}
+.cards>.intblock{min-width:0;display:contents}
+.card .lb{font:400 13px/1.4 var(--font);color:var(--ink66)}
+.card .fig{font:400 clamp(34px,4.4vw,54px)/1.02 var(--font);letter-spacing:-.032em;margin:14px 0 4px}
+.card .fig.alert{color:var(--alert)}
+.card .fig small{font-size:.36em;letter-spacing:-.01em;color:var(--ink66);margin-left:8px}
+.card .who{font:400 20px/1.25 var(--font);letter-spacing:-.014em;margin:0 0 10px}
+.card .sen{font:400 15px/1.55 var(--font);margin:0;max-width:28em}
+.card .sen em{font-style:normal;border-bottom:1px solid var(--line)}
+.card .ref{font:400 12.5px/1.5 var(--font);color:var(--ink66);margin-top:14px;padding-top:12px;
+  border-top:1px solid var(--line8)}
 
-/* --- Section 12: question register --- */
-.explorer{display:grid; grid-template-columns:16rem 1fr; gap:1.25rem; margin:1.25rem 0; align-items:start}
-.q-register{border:1px solid var(--rule); background:rgba(255,255,255,.4); max-height:34rem; overflow-y:auto}
-.q-group-head{
-  display:flex; justify-content:space-between; align-items:baseline; gap:.5rem;
-  margin:0; padding:.5rem .7rem; font-size:.66rem; letter-spacing:.14em;
-  text-transform:uppercase; color:var(--ink-soft);
-  border-bottom:1px solid var(--rule); background:rgba(255,255,255,.5); position:sticky; top:0;
-}
-.q-count{font-size:.62rem; opacity:.8}
-.q-list{list-style:none; margin:0; padding:0}
-.q-item{
-  display:flex; gap:.5rem; width:100%; text-align:left; background:none; cursor:pointer;
-  border:0; border-bottom:1px solid var(--rule); padding:.5rem .7rem;
-  font:inherit; font-size:.8rem; line-height:1.35; color:var(--ink);
-}
-.q-item:hover{background:rgba(255,255,255,.75)}
-.q-item.active{background:var(--ink); color:var(--carton)}
-.q-item.active .q-id{color:var(--carton); opacity:.7}
-.q-id{
-  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.68rem;
-  color:var(--ink-soft); flex:0 0 auto; padding-top:.1rem;
-}
-.q-detail{border:1px solid var(--rule); background:rgba(255,255,255,.4); padding:1rem}
-.q-detail-head{display:flex; gap:.6rem; align-items:center; font-size:.66rem;
-  letter-spacing:.14em; text-transform:uppercase; color:var(--ink-soft); margin-bottom:.4rem}
-.q-question{font-size:1.15rem; font-weight:700; line-height:1.3; margin:0 0 .35rem}
-.q-meta{font-size:.7rem; letter-spacing:.06em; text-transform:uppercase;
-  color:var(--ink-soft); margin:0 0 1rem}
-.q-cells{display:grid; grid-template-columns:repeat(auto-fit,minmax(11rem,1fr)); gap:.6rem}
-.q-cell{border:1px solid var(--rule); padding:.6rem; background:rgba(255,255,255,.55)}
-.q-cell-head{font-size:.72rem; font-weight:700; margin-bottom:.5rem}
-.q-cell-head em{font-style:normal; font-weight:400; color:var(--ink-soft); display:block; font-size:.68rem}
-.q-ents{list-style:none; margin:0 0 .5rem; padding:0}
-.q-ents li{display:flex; align-items:center; gap:.35rem; margin-bottom:.25rem; font-size:.76rem}
-.q-ent-name{flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
-.q-ent-type{font-size:.56rem; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-soft)}
-.dots{display:inline-flex; gap:2px; flex:0 0 auto}
-.dot{width:7px; height:11px; background:var(--bar-track); display:block}
-.dot.on{background:var(--bar)}
-.q-none{font-size:.76rem; color:var(--ink-soft); font-style:italic; margin:0 0 .5rem}
-.q-flag{font-size:.72rem; color:var(--stamp); border-left:2px solid var(--stamp);
-  padding-left:.4rem; margin:.4rem 0}
-.q-runs{display:flex; flex-wrap:wrap; gap:.25rem; margin-top:.5rem}
-.q-run{
-  font:inherit; font-size:.66rem; letter-spacing:.06em; text-transform:uppercase;
-  background:none; border:1px solid var(--ink-soft); color:var(--ink);
-  padding:.2rem .4rem; cursor:pointer;
-}
-.q-run:hover{background:var(--ink); color:var(--carton); border-color:var(--ink)}
-.tr{border:1px solid var(--ink); margin-top:1rem; background:rgba(255,255,255,.7)}
-.tr-head{
-  display:flex; justify-content:space-between; align-items:center; gap:.5rem;
-  background:var(--ink); color:var(--carton); padding:.4rem .6rem;
-  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-  font-size:.64rem; letter-spacing:.1em; text-transform:uppercase;
-}
-.tr-close{font:inherit; background:none; border:1px solid var(--carton);
-  color:var(--carton); padding:.1rem .4rem; cursor:pointer}
-.tr-body{display:grid; grid-template-columns:5.5rem 1fr; gap:.8rem; padding:.8rem}
-.tr-attr{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.6rem;
-  letter-spacing:.08em; text-transform:uppercase; color:var(--stamp); line-height:1.5}
-.tr-text{white-space:pre-wrap; font-size:.84rem; line-height:1.5; overflow-x:auto}
-.jump{display:inline-block; margin:.5rem 0; font-size:.8rem}
+/* pills */
+.pills{display:flex;flex-wrap:wrap;gap:10px}
+.pill{border:1px solid var(--black);border-radius:999px;padding:9px 18px;font:400 15px/1.3 var(--font);
+  color:var(--black);transition:background .12s,color .12s}
+.pill:hover{background:rgba(11,11,38,.06)}
+.pill[aria-pressed="true"]{background:var(--black);color:var(--white)}
+.window.dark .pill{border-color:var(--onl22);color:var(--white)}
+.window.dark .pill:hover{background:rgba(254,251,230,.1)}
+.window.dark .pill[aria-pressed="true"]{background:var(--white);color:var(--black);border-color:var(--white)}
 
-@media (max-width:720px){
-  .explorer{grid-template-columns:1fr}
-  .q-register{max-height:16rem}
-  .tr-body{grid-template-columns:1fr; gap:.4rem}
+/* 2 · intentioner og spørgsmål */
+.intents{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:26px}
+.itile{background:var(--white100);border:1px solid var(--line8);border-radius:24px;
+  padding:18px 18px 20px;text-align:left}
+.itile:hover{border-color:var(--line)}
+.itile[aria-pressed="true"]{background:var(--black);border-color:var(--black);color:var(--white)}
+.itile .n{font:400 17px/1.25 var(--font)}
+.itile .q{font:400 38px/1 var(--font);letter-spacing:-.03em;margin:10px 0 2px}
+.itile .u{font:400 13px/1.4 var(--font);color:var(--ink66)}
+.itile[aria-pressed="true"] .u{color:var(--onl66)}
+.itile .ticks{display:flex;gap:3px;margin-top:14px;flex-wrap:wrap}
+.itile .ticks i{width:8px;height:14px;border-radius:2px;background:rgba(11,11,38,.16);display:block}
+.itile .ticks i.doc{background:var(--green)}
+.itile .ticks i.err{box-shadow:inset 0 0 0 2px var(--black)}
+.itile[aria-pressed="true"] .ticks i{background:var(--onl22)}
+.itile[aria-pressed="true"] .ticks i.doc{background:var(--green)}
+.itile[aria-pressed="true"] .ticks i.err{box-shadow:inset 0 0 0 2px var(--white)}
+.tickkey{display:flex;flex-wrap:wrap;gap:8px 22px;margin:-14px 0 26px;font-size:13px;color:var(--ink66)}
+.tickkey span{display:flex;align-items:center;gap:8px}
+.tickkey i{width:8px;height:14px;border-radius:2px;background:var(--green);display:block}
+.tickkey i.err{box-shadow:inset 0 0 0 2px var(--black)}
+
+.qsplit{display:grid;grid-template-columns:1.1fr 1fr;gap:40px}
+.qrow{display:grid;grid-template-columns:56px 1fr 92px;gap:0 12px;width:100%;text-align:left;
+  align-items:baseline;padding:12px 0;border-top:1px solid var(--line8)}
+.qrow .id{font:400 13px/1.55 var(--font);color:var(--ink66)}
+.qrow .tx{font:400 16.5px/1.5 var(--font)}
+.qrow:hover .tx{color:var(--blue)}
+.qrow[aria-expanded="true"] .tx{color:var(--blue)}
+.qflag{font:400 12.5px/1.4 var(--font);color:var(--alert);text-align:right}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 22px;max-width:var(--measure)}
+.chip{border:1px solid var(--line);border-radius:999px;padding:6px 14px;font:400 14.5px/1.3 var(--font)}
+.chip s{text-decoration:none;color:var(--ink66);font-size:12.5px;margin-left:4px}
+
+.detail{margin-top:26px;background:var(--lpink);border-radius:24px;padding:26px 28px 24px}
+.verbatim{font:400 clamp(20px,2.1vw,26px)/1.34 var(--font);letter-spacing:-.014em;
+  margin:10px 0 20px;max-width:26em}
+.qcells{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.qcell{min-width:0}
+.qcell-head{font:400 15px/1.3 var(--font);padding-bottom:8px;border-bottom:1px solid var(--line)}
+.qcell-head em{display:block;font-style:normal;font-size:13px;color:var(--ink66);margin-top:2px}
+.qents{list-style:none;margin:10px 0 0;padding:0}
+.qents li{display:grid;grid-template-columns:1fr auto;gap:0 10px;padding:5px 0;
+  border-bottom:1px solid rgba(11,11,38,.06);font-size:14.5px;line-height:1.35}
+.qents .en{grid-column:1;grid-row:1;min-width:0;overflow-wrap:anywhere}
+.qents .et{grid-column:1;grid-row:2;font-size:12px;color:var(--ink66)}
+.qents .ec{grid-column:2;grid-row:1 / span 2;align-self:center;display:flex;align-items:center;
+  gap:5px;font-size:12.5px;color:var(--ink66);white-space:nowrap}
+.qents .ec i{width:6px;height:11px;border-radius:2px;background:rgba(11,11,38,.14);display:block}
+.qents .ec i.on{background:var(--black)}
+.qnone{font-size:14px;color:var(--ink66);margin:10px 0 0}
+.qerr{font:400 13.5px/1.45 var(--font);color:var(--alert);margin:10px 0 0}
+.qmeta{font-size:12.5px;color:var(--ink66);margin-top:10px}
+.qruns{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.qrun{border:1px solid var(--line);border-radius:999px;padding:4px 12px;font:400 13px/1.4 var(--font)}
+.qrun:hover{border-color:var(--black)}
+.qrun[aria-pressed="true"]{background:var(--black);color:var(--white);border-color:var(--black)}
+.quote{border-left:2px solid var(--blue);padding:2px 0 2px 20px;margin:18px 0;max-width:44em}
+.quote p{font:400 19px/1.5 var(--font);margin:0 0 8px}
+.quote p b{font-weight:400;border-bottom:1px solid var(--line)}
+.quote p i{font-style:italic}
+.quote .src{font:400 13px/1.5 var(--font);color:var(--ink66)}
+mark.gone{background:transparent;color:var(--alert)}
+.tr{margin-top:22px;border-top:1px solid var(--line);padding-top:16px}
+.tr-head{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:baseline;font:400 13px/1.4 var(--font);
+  color:var(--ink66);margin-bottom:12px}
+.tr-close{margin-left:auto;border:1px solid var(--line);border-radius:999px;padding:3px 12px;font-size:13px}
+.tr-text{border-left:2px solid var(--blue);padding-left:20px;white-space:pre-wrap;
+  font:400 15.5px/1.6 var(--font);max-width:46em;overflow-wrap:anywhere}
+.tr-text strong{font-weight:700}
+.tr-text em{font-style:italic}
+.tr-text b.th{display:block;font-weight:400;font-size:17px;letter-spacing:-.012em;
+  margin:22px 0 6px;color:var(--black)}
+.tr-text b.th:first-child{margin-top:0}
+
+/* 3 · matrix */
+.famhead{font:400 17px/1.3 var(--font);color:var(--ink66);margin:0 0 16px;letter-spacing:0}
+.window.dark .famhead{color:var(--onl66)}
+.tls{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:0 0 26px;
+  padding-bottom:22px;border-bottom:1px solid var(--onl22)}
+.tl{min-width:0}
+.tl-c{font:400 13px/1.4 var(--font);color:var(--onl66)}
+.tl-c em{font-style:normal;display:block}
+.tl-v{font:400 30px/1.1 var(--font);letter-spacing:-.03em;margin:6px 0 4px}
+.tl-s{font:400 12.5px/1.45 var(--font);color:var(--onl66)}
+.mwrap{overflow-x:auto}
+table.m{width:100%;border-collapse:collapse}
+.m th{font:400 13px/1.4 var(--font);color:var(--onl66);text-align:left;vertical-align:bottom;
+  padding:0 14px 12px 0;border-bottom:1px solid var(--onl22)}
+.m th span{display:block;color:var(--white);font-size:17px;letter-spacing:-.012em;margin-top:2px}
+.m td{padding:14px 14px 14px 0;border-bottom:1px solid rgba(254,251,230,.12);vertical-align:middle}
+.m td.name{min-width:200px;font:400 17px/1.3 var(--font);letter-spacing:-.01em}
+.m td.name i{display:block;font-style:normal;font-size:13px;color:var(--onl66);margin-top:2px}
+.m td.name i.gone{color:var(--pink100)}
+.m td.name .mark{display:none;align-items:center;gap:6px;margin-top:6px;width:fit-content;
+  font:400 12.5px/1.4 var(--font);color:var(--green)}
+.m td.name .mark b{width:8px;height:8px;border-radius:2px;background:var(--green);display:block}
+.m tr.grp td{padding:26px 0 8px;border-bottom:0;font:400 13px/1.4 var(--font);color:var(--onl66)}
+.m tr.grp .grp-dot{display:inline-block;width:26px;height:12px;border-radius:6px;margin-right:10px;
+  vertical-align:-1px}
+.grp-dot.vis{background:var(--purple100)}
+.grp-dot.mar{background:var(--pink100)}
+.grp-dot.usy{background:var(--white);opacity:.5}
+.cellcol{min-width:140px}
+.track{position:relative;height:14px;border-radius:7px;background:rgba(254,251,230,.09)}
+.rng{position:absolute;top:0;bottom:0;border-radius:7px;background:rgba(254,251,230,.2)}
+.bar{position:absolute;left:0;top:0;bottom:0;border-radius:7px;background:var(--purple100)}
+.bar.seen{min-width:3px}
+.bar.mar{background:var(--pink100)}
+.bar.usy{background:var(--white);opacity:.5}
+.num{font:400 17px/1.3 var(--font);letter-spacing:-.014em;margin-top:8px;color:var(--purple100)}
+.num.mar{color:var(--pink100)}
+.num.usy{color:var(--onl66)}
+.num s{text-decoration:none;font-size:12.5px;color:var(--onl66);margin-left:6px;white-space:nowrap}
+.num u{text-decoration:none;font-size:13px;color:var(--onl66)}
+.band{font:400 12.5px/1.4 var(--font);color:var(--onl66);margin-top:2px}
+.keys{display:flex;flex-wrap:wrap;gap:12px 26px;margin-top:24px;font-size:13.5px;color:var(--onl66)}
+.keys div{display:flex;gap:9px;align-items:center}
+.k{width:26px;height:12px;border-radius:6px;flex:none}
+.k.v{background:var(--purple100)}.k.m{background:var(--pink100)}
+.k.u{background:var(--white);opacity:.5}.k.r{background:rgba(254,251,230,.2)}
+.k.o{background:var(--green);width:12px}
+.kd{color:var(--white);font-size:15px}
+
+/* lyse tabeller */
+table.t{width:100%;border-collapse:collapse;font-size:16px;margin-top:8px}
+.t th{font:400 13px/1.4 var(--font);color:var(--ink66);text-align:right;padding:0 0 12px 14px;
+  border-bottom:1px solid var(--black);vertical-align:bottom}
+.t th:first-child{text-align:left;padding-left:0}
+.t td{padding:14px 0 14px 14px;border-bottom:1px solid var(--line8);text-align:right}
+.t td:first-child{text-align:left;padding-left:0}
+.t td.txt,.t th.txt{text-align:left;color:var(--ink66);font-size:15px}
+.t.app{font-size:15px;min-width:860px}
+.t.app td{padding:9px 0 9px 14px}
+.t.app td:first-child,.t.app th:first-child{padding-left:0}
+.t.app tr:first-child td{padding-top:14px}
+.t.app td.ent{font-size:16px}
+.t.app td.ent.cont{color:transparent}
+
+/* 4 · lukkede kæder */
+.gonelist{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:0 0 30px}
+.gonerow{border-top:1px solid var(--black);padding-top:14px;min-width:0}
+.gonerow .a{font:400 21px/1.25 var(--font);letter-spacing:-.014em}
+.gonerow .b{font:400 13px/1.4 var(--font);color:var(--alert);margin:2px 0 8px}
+.gonerow .c{font:400 14.5px/1.5 var(--font);color:var(--ink66);max-width:30em}
+
+/* 5 · forbehold */
+.lims{display:grid;grid-template-columns:1fr 1fr;gap:0 48px}
+.lim{padding:20px 0;border-top:1px solid rgba(11,11,38,.18)}
+.lim .n{font:400 13px/1.4 var(--font);color:var(--ink66)}
+.lim h4{font:400 21px/1.3 var(--font);letter-spacing:-.014em;margin:6px 0 8px}
+.lim p{font:400 15px/1.58 var(--font);margin:0;max-width:30em}
+
+.foot{margin-top:12px;border-top:1px solid var(--line);padding-top:18px;display:flex;flex-wrap:wrap;
+  gap:8px 32px;font-size:13px;color:var(--ink66)}
+
+/* tilstand: familie og intention styres af to attributter, ikke af genrendering */
+#report[data-fam="brands"] .fam-shops{display:none}
+#report[data-fam="shops"] .fam-brands{display:none}
+#report[data-intent="pris"] .intblock:not(.int-pris),
+#report[data-intent="smag"] .intblock:not(.int-smag),
+#report[data-intent="anvendelse"] .intblock:not(.int-anvendelse),
+#report[data-intent="vaerdier"] .intblock:not(.int-vaerdier),
+#report[data-intent="sammenligning"] .intblock:not(.int-sammenligning){display:none}
+#report[data-intent="pris"] .mark[data-int="pris"],
+#report[data-intent="smag"] .mark[data-int="smag"],
+#report[data-intent="anvendelse"] .mark[data-int="anvendelse"],
+#report[data-intent="vaerdier"] .mark[data-int="vaerdier"],
+#report[data-intent="sammenligning"] .mark[data-int="sammenligning"]{display:flex}
+
+@media (max-width:1040px){
+  .wrap{padding:0 24px 64px}
+  /* Invariant: udløbsdatoen skal kunne ses uden at scrolle — også ved 380px.
+     Derfor flytter stemplet op over rubrikken, når forsiden bliver én kolonne. */
+  .hero{display:flex;flex-direction:column;gap:32px}
+  .heroside{display:contents}
+  .stampbox{order:-1}
+  .facts{order:1;margin-top:0;border-top:0;padding-top:0}
+  .cards{grid-template-columns:1fr 1fr}
+  .intents{grid-template-columns:1fr 1fr 1fr}
+  .qsplit,.lims{grid-template-columns:1fr;gap:28px}
+  .qcells,.tls,.gonelist{grid-template-columns:1fr 1fr}
+}
+@media (max-width:560px){
+  .wrap{padding:0 16px 56px}
+  .window{padding:24px 20px 26px;border-radius:24px}
+  .cards{grid-template-columns:1fr}
+  .intents{grid-template-columns:1fr 1fr}
+  .aurora{height:96px;border-radius:24px;margin-bottom:28px}
+  .qrow{grid-template-columns:1fr}
+  .qrow .id{margin-bottom:2px}
+  .qflag{text-align:left;margin-top:4px}
+  .qflag br{display:none}
+  .qcells,.tls,.gonelist{grid-template-columns:1fr}
+  .detail{padding:22px 18px}
+  .cellcol{min-width:118px}
+  .m td.name{min-width:140px}
 }
 @media print{
-  .q-detail,.noprint,.q-runs{display:none}
-  .q-register{max-height:none; overflow:visible; border:0; background:none}
-  .explorer{display:block}
-  .q-item{border-bottom:1px solid #ddd}
+  body{background:#fff;font-size:10.5pt}
+  .aurora,.noprint,.tr{display:none !important}
+  .pills,.itile .ticks{display:none}
+  .window{border-radius:0;padding:0;margin:0 0 22pt;background:#fff !important;color:#000 !important;border:0}
+  .window.dark{border:1pt solid #000;padding:12pt}
+  .window.dark h2,.window.dark h3,.window.dark p,.window.dark .small{color:#000}
+  .m th,.m td,.m th span,.num,.band,.tl-v,.tl-s,.tl-c,.famhead{color:#000 !important}
+  .m td,.m th{border-color:#999}
+  .tls{border-bottom:1pt solid #000}
+  .qpanel[hidden]{display:block !important}
+  .detail{background:#fff;border:1pt solid #000}
+  #report .intblock,#report .famblock,#report .mark{display:block !important}
+  .window,tr,.lim,.card,.qpanel{break-inside:avoid}
 }
+"""
 
-@media (max-width:420px){
-  .sheet{padding:1.25rem .85rem 3rem}
-  h1{font-size:1.45rem}
-  .bar-row{grid-template-columns:6.6rem 1fr 2.9rem}
-  .bar-label{font-size:.66rem}
-}
-@media print{
-  body{background:#fff}
-  .sheet{max-width:none; padding:0}
-  h2{page-break-after:avoid}
-  .scroll{overflow:visible}
-  table{min-width:0; font-size:.7rem}
-}
+JS = r"""
+(function () {
+  var report = document.getElementById('report');
+  if (!report) return;
+  var blob = document.getElementById('qdata');
+  var DATA = blob ? JSON.parse(blob.textContent) : {answers: {}, cellLabels: {}};
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
+    });
+  }
+
+  // Transcripts are shown as transcripts: whitespace preserved, and only the
+  // markdown the models actually wrote is interpreted — headings, bold, italic,
+  // bullets. Everything is escaped first; nothing else is touched. A
+  // half-working renderer would quietly misrepresent the evidence.
+  function transcript(text) {
+    return esc(text)
+      .replace(/\n*^#{1,6}[ \t]*(.+)$\n*/gm, '<b class="th">$1</b>')
+      .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s.,;:)]|$)/g, '$1<em>$2</em>')
+      .replace(/^[ \t]*[-–][ \t]+/gm, '– ');
+  }
+
+  function setFamily(fam) {
+    report.dataset.fam = fam;
+    report.querySelectorAll('[data-fam]').forEach(function (b) {
+      if (b.tagName === 'BUTTON') b.setAttribute('aria-pressed', String(b.dataset.fam === fam));
+    });
+  }
+
+  function setIntent(intent) {
+    report.dataset.intent = intent;
+    report.querySelectorAll('.itile').forEach(function (b) {
+      b.setAttribute('aria-pressed', String(b.dataset.int === intent));
+    });
+    closePanels();
+  }
+
+  function closePanels() {
+    report.querySelectorAll('.qpanel').forEach(function (p) { p.hidden = true; });
+    report.querySelectorAll('.qrow').forEach(function (r) {
+      r.setAttribute('aria-expanded', 'false');
+    });
+  }
+
+  function togglePanel(row) {
+    var open = row.getAttribute('aria-expanded') === 'true';
+    closePanels();
+    if (open) return;
+    var panel = document.getElementById('p-' + row.dataset.q);
+    if (!panel) return;
+    row.setAttribute('aria-expanded', 'true');
+    panel.hidden = false;
+    panel.scrollIntoView({block: 'nearest'});
+  }
+
+  function showRun(button) {
+    var panel = button.closest('.qpanel');
+    if (!panel) return;
+    var slot = panel.querySelector('.tslot');
+    var qid = button.dataset.q, cell = button.dataset.cell, pass = button.dataset.pass;
+    var pressed = button.getAttribute('aria-pressed') === 'true';
+    panel.querySelectorAll('.qrun').forEach(function (b) {
+      b.setAttribute('aria-pressed', 'false');
+    });
+    if (pressed) { slot.innerHTML = ''; return; }
+    var list = DATA.answers[qid] || [];
+    var hit = null;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].cell === cell && String(list[i].pass) === String(pass)) hit = list[i];
+    }
+    if (!hit) { slot.innerHTML = ''; return; }
+    button.setAttribute('aria-pressed', 'true');
+    var label = DATA.cellLabels[cell] || [cell, ''];
+    slot.innerHTML =
+      '<div class="tr"><div class="tr-head"><span>Transkript · ' + esc(label[0]) + ' ' +
+      esc(label[1]) + ' · kørsel ' + esc(pass) + ' · uredigeret</span>' +
+      '<span>modellens ord, ikke rapportens</span>' +
+      '<button type="button" class="tr-close">luk</button></div>' +
+      '<div class="tr-text">' + transcript(hit.text) + '</div></div>';
+  }
+
+  report.addEventListener('click', function (ev) {
+    var pill = ev.target.closest('.pill[data-fam]');
+    if (pill) { setFamily(pill.dataset.fam); return; }
+    var tile = ev.target.closest('.itile');
+    if (tile) { setIntent(tile.dataset.int); return; }
+    var row = ev.target.closest('.qrow');
+    if (row) { togglePanel(row); return; }
+    var run = ev.target.closest('.qrun');
+    if (run) { showRun(run); return; }
+    var close = ev.target.closest('.tr-close');
+    if (close) {
+      var panel = close.closest('.qpanel');
+      panel.querySelector('.tslot').innerHTML = '';
+      panel.querySelectorAll('.qrun').forEach(function (b) {
+        b.setAttribute('aria-pressed', 'false');
+      });
+    }
+  });
+
+  setFamily(report.dataset.fam || 'brands');
+  setIntent(report.dataset.intent);
+})();
 """
 
 
@@ -745,70 +1484,61 @@ def build(result: dict, answers: list[dict]) -> str:
         datetime.fromisoformat(measured) + timedelta(days=config.SHELF_LIFE_DAYS)
     ).strftime("%d.%m.%Y")
 
-    spaced = len(meta["passes"]) > 1
-    consistency_note = (
-        "Kørslerne blev foretaget med timers mellemrum, så konsistenstallet også "
-        "afspejler variation over tid — ikke kun modellens tilfældighed i det enkelte kald."
-        if spaced else
-        "Kørslerne blev foretaget i træk, så konsistenstallet afspejler modellens "
-        "tilfældighed i det enkelte kald, ikke variation over tid."
+    brands = family(result, "maerke")
+    shops = family(result, "butik")
+    first_intent = next(iter(result["by_intent"]))
+
+    grouped: dict[str, list[dict]] = {}
+    for answer in answers:
+        grouped.setdefault(answer["prompt_id"], []).append(answer)
+    payload = {
+        "cellLabels": {k: list(v) for k, v in CELL_LABELS.items()},
+        "answers": {
+            qid: [
+                {
+                    "cell": f"{a['model_key']}/{a['condition']}",
+                    "pass": int(a["pass"]),
+                    "text": a["text"],
+                }
+                for a in sorted(
+                    items,
+                    key=lambda a: (
+                        CELL_ORDER.index(f"{a['model_key']}/{a['condition']}"),
+                        int(a["pass"]),
+                    ),
+                )
+            ]
+            for qid, items in grouped.items()
+        },
+    }
+    blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+
+    # What a shared link says about itself. Derived, like everything else, so a
+    # rerun with other numbers cannot leave a stale claim in the preview card.
+    share_text = (
+        f"{meta['questions']} danske spørgsmål om mejeri, stillet i "
+        f"{len(meta['cells'])} celler × {len(meta['passes'])} kørsler = "
+        f"{meta['answers']} svar. Hvilke mærker og dagligvarekæder nævner "
+        f"sprogmodellerne — og hvem findes slet ikke i svaret? Målt "
+        f"{dk_date(measured)}, mindst holdbar til {expires}."
     )
 
-    cells = [cell for cell in CELL_ORDER if cell in meta["cells"]]
-
     body = f"""
-<header>
-  <p class="eyebrow">Måling · dansk mejeri · {esc(measured)}</p>
-  <h1>{esc(config.REPORT_TITLE)}</h1>
-  <p class="lede">FMCG-virksomheder måler synlighed på hylden, på Google og i medierne.
-  Ingen måler, hvad en sprogmodel svarer, når en forbruger spørger, hvilken yoghurt der
-  smager bedst, eller hvor mælk er billigst. Det her er en dateret, reproducerbar måling
-  af netop det: {esc(meta['answers'])} svar fra to sprogmodeller, hver kørt både med og
-  uden websøgning, på {esc(meta['questions'])} spørgsmål der ikke nævner ét eneste
-  mærke- eller butiksnavn.</p>
-  <div class="stamp">
-    <span class="stamp-label">Mindst holdbar til</span>
-    <span class="stamp-date">{esc(expires)}</span>
-  </div>
-  <p class="footnote">Ikke fordi tallene bliver forkerte den dag, men fordi de holder op
-  med at betyde noget. Modeller opdateres uden varsel. {esc(consistency_note)}</p>
-</header>
-
-<h2>Den blinde vinkel</h2>
-<p>En dansk forbruger, der overvejer hvilken yoghurt hun skal købe, har fået en ny
-rådgiver. Den har ingen hylde, ingen annoncepris og ingen mediekontakt. Den nævner nogle
-mærker og ikke andre, og den gør det med samme rolige sikkerhed uanset om den har ret.</p>
-<p>For en producent er det en kanal uden baseline, uden KPI og uden intern ejer. Ikke
-fordi nogen har fejlet, men fordi kanalen opstod hurtigere, end nogen nåede at bygge
-måling til den. Denne rapport bygger målingen — én gang, på ét marked — så det kan
-diskuteres konkret frem for principielt.</p>
-
-{key_figures(result)}
-
+{cover(result, measured, expires)}
+{summary_cards(result, brands, shops)}
+{questions_section(result, answers)}
+{matrix_section(result, brands, shops)}
 {defunct_section(result)}
-
-{chart(result, "butik", "Butikker", "Hvilke dagligvarekæder bringer modellerne selv på banen, når spørgsmålet ikke nævner nogen?")}
-
-{chart(result, "maerke", "Mærker", "Samme spørgsmål, samme svar — her talt op på mærkeniveau.")}
-
-{full_table(result)}
-
-{disagreement_section(result)}
-
-{intent_section(result)}
-
-{limitations()}
-
+{limitations_section()}
 {method_section(result)}
-
-{question_explorer(result, answers)}
-
-<footer>
-  <p>Målt {esc(measured)}. Rapporten er et selvstændigt HTML-dokument uden eksterne
-  afhængigheder. Rå svar og API-nøgler er ikke en del af repoet.</p>
-  <p>Rapporten rangordner ikke navngivne virksomheder og indeholder ingen anbefalinger
-  til dem. Den viser en blind vinkel.</p>
-</footer>
+{appendix(result, brands, shops)}
+<div class="foot">
+  <span>Måling {esc(dk_date(measured))}</span>
+  <span>Mindst holdbar til {esc(expires)}</span>
+  <span>{esc(meta['questions'])} spørgsmål · {esc(len(meta['cells']))} celler ·
+    {esc(meta['answers'])} svar</span>
+  <span>Ingen anbefalinger til navngivne virksomheder</span>
+</div>
 """
 
     return f"""<!doctype html>
@@ -817,11 +1547,26 @@ diskuteres konkret frem for principielt.</p>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow, noarchive">
-<title>{esc(config.REPORT_TITLE)}</title>
+<title>Synlighed i sprogmodeller · dansk mejeri · måling {esc(dk_date(measured))}</title>
+<meta name="description" content="{esc(share_text)}">
+<meta property="og:type" content="article">
+<meta property="og:locale" content="da_DK">
+<meta property="og:title" content="Synlighed i sprogmodeller · dansk mejeri">
+<meta property="og:description" content="{esc(share_text)}">
+<meta name="twitter:card" content="summary">
 <style>{CSS}</style>
 </head>
 <body>
-<main class="sheet">{body}</main>
+<div class="wrap" id="report" data-fam="brands" data-intent="{esc(first_intent)}">
+{body}
+</div>
+<noscript><p style="padding:0 40px 40px;color:#E31F04;max-width:724px">Uden JavaScript
+står siden på første intention og på mærketabellen, og spørgsmålspanelerne kan ikke
+åbnes. Alt indhold er stadig i dokumentet — udskriv siden (eller gem den som PDF), så
+foldes alle intentioner, begge entitetstabeller og alle {esc(meta['questions'])}
+spørgsmålspaneler ud.</p></noscript>
+<script type="application/json" id="qdata">{blob}</script>
+<script>{JS}</script>
 </body>
 </html>
 """
