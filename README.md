@@ -4,8 +4,12 @@ En dateret, reproducerbar måling af, hvilke mejerimærker og hvilke
 dagligvarekæder sprogmodeller faktisk anbefaler, når danske forbrugere spørger
 til råds.
 
-**[Læs rapporten](https://christopherc97.github.io/llm-brand-visibility-dk/)** — udgives efter den fulde kørsel.
-udskift linket med din egen GitHub Pages-adresse efter første udgivelse.
+**[Læs rapporten](https://christopherc97.github.io/llm-brand-visibility-dk/)** — måling
+13.08.2026, mindst holdbar til 11.11.2026. Én HTML-fil med alle 420 svar indeni.
+
+Udgivelse: rapporten ligger i `docs/` og serveres af GitHub Pages fra `main`.
+Kør `python3 report.py && python3 report_selftest.py`, commit `docs/index.html`,
+og push — Pages bygger selv om på et halvt minut.
 
 ---
 
