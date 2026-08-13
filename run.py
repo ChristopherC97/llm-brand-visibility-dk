@@ -92,8 +92,29 @@ def call_anthropic(model: str, question: str, search: bool) -> dict:
     if search:
         kwargs["tools"] = [{"type": "web_search_20260209", "name": "web_search"}]
 
-    response = client.messages.create(**kwargs)
+    # Server-side tools can end a turn with `pause_turn` when the tool loop
+    # hits its iteration limit. The documented fix is to re-send the turn with
+    # the assistant content appended; the server picks up where it left off.
+    # Without this, a searching answer can be stored as a bare preamble
+    # ("Jeg søger lidt information for dig.") and silently undercount.
+    messages = [{"role": "user", "content": question}]
+    for _ in range(4):
+        kwargs["messages"] = messages
+        response = client.messages.create(**kwargs)
+        if response.stop_reason != "pause_turn":
+            break
+        messages = messages + [{"role": "assistant", "content": response.content}]
+
     text = "\n".join(block.text for block in response.content if block.type == "text")
+
+    # A turn that stopped to call a tool is not an answer. Refusing it here
+    # means the record is never written, so the next run fetches it again —
+    # a partial answer must never enter the dataset.
+    if response.stop_reason not in {"end_turn", "max_tokens"}:
+        raise RuntimeError(
+            f"turen blev ikke færdig (stop_reason={response.stop_reason}); prøves igen ved næste kørsel"
+        )
+
     return {
         "text": text,
         "stop_reason": response.stop_reason,

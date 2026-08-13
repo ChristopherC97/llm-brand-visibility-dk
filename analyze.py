@@ -204,6 +204,7 @@ def analyse(rows: list[dict]) -> dict:
         "defunct": build_defunct(rows_by_cell),
         "disagreement": build_disagreement(rows_by_cell, per_entity, cells),
         "by_intent": build_intent(rows, etype),
+        "questions": build_questions(rows, display, etype),
         "unknown_names": [
             {"name": name, "count": count} for name, count in corpus_unknown_names(rows)[:60]
         ],
@@ -352,6 +353,86 @@ def build_disagreement(rows_by_cell, per_entity, cells) -> dict:
     return out
 
 
+def build_questions(rows, display, etype) -> list[dict]:
+    """Per-question breakdown, for drilling into a single question.
+
+    Deliberately carries counts ("appeared in 2 of 3 runs"), never percentages.
+    One question is three answers per cell; a percentage on three observations
+    is a decimal point pretending to be a measurement.
+
+    No answer text lives here — raw answers go to a separate, gitignored file
+    so publishing them stays an explicit decision rather than a side effect.
+    """
+    by_question: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        by_question[row["prompt_id"]].append(row)
+
+    out = []
+    for prompt in prompts.PROMPTS:
+        question_rows = by_question.get(prompt.id, [])
+        if not question_rows:
+            continue
+        cells: dict[str, dict] = {}
+        for cell in sorted({cell_key(row) for row in question_rows}):
+            cell_rows = [row for row in question_rows if cell_key(row) == cell]
+            hits: Counter[str] = Counter()
+            order: dict[str, int] = {}
+            for row in cell_rows:
+                for key, start in row["_first"].items():
+                    hits[key] += 1
+                    order.setdefault(key, start)
+            entities_here = [
+                {
+                    "key": key,
+                    "display": display[key],
+                    "type": etype[key].value,
+                    "runs_present": count,
+                    "runs_total": len(cell_rows),
+                }
+                for key, count in sorted(hits.items(), key=lambda kv: (-kv[1], order[kv[0]]))
+            ]
+            cells[cell] = {
+                "runs": len(cell_rows),
+                "entities": entities_here,
+                "defunct_errors": sum(
+                    1 for row in cell_rows if any(h.is_error for h in row["_defunct"])
+                ),
+                "median_length": sorted(row["_length"] for row in cell_rows)[len(cell_rows) // 2],
+            }
+        out.append({
+            "id": prompt.id,
+            "intent": prompt.intent,
+            "text": prompt.text,
+            "cells": cells,
+        })
+    return out
+
+
+def write_answers(rows) -> None:
+    """Full answer texts, in their own file. Gitignored by default.
+
+    Publishing 420 model-written texts about named companies is a decision,
+    not a by-product of running the analysis. Keeping them out of metrics.json
+    means the report cannot inline them by accident.
+    """
+    payload = [
+        {
+            "prompt_id": row["prompt_id"],
+            "question": row["question"],
+            "intent": row["intent"],
+            "model_key": row["model_key"],
+            "condition": row["condition"],
+            "pass": row["pass"],
+            "text": row["text"],
+            "entities": sorted(row["_first"]),
+        }
+        for row in rows
+    ]
+    (config.DATA_DIR / "answers.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+
+
 def build_intent(rows, etype) -> dict:
     """Qualitative only. Counts are directional; no per-intent rates are published."""
     out: dict[str, dict] = {}
@@ -421,6 +502,7 @@ def main() -> int:
     )
     write_csv(result)
     write_unknown(result)
+    write_answers(rows)
 
     meta = result["meta"]
     print(f"Analyserede {meta['answers']} svar fordelt på {len(meta['cells'])} celler.")

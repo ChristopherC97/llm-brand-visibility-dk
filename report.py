@@ -46,6 +46,19 @@ def load() -> dict:
     return json.loads(config.METRICS_PATH.read_text(encoding="utf-8"))
 
 
+def load_answers() -> list[dict]:
+    """All 420 answers, published in full alongside the report.
+
+    The artifact's central claim is that anyone can re-run it and get the same
+    numbers. Keeping the evidence behind the numbers hidden would weaken
+    exactly that claim, so the transcripts ship with the page.
+    """
+    path = config.DATA_DIR / "answers.json"
+    if not path.exists():
+        raise SystemExit(f"Mangler {path}.\nKør først:  python3 analyze.py")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 # --- Components --------------------------------------------------------------
 
 
@@ -146,6 +159,7 @@ def key_figures(result: dict) -> str:
         f"<thead><tr><th>Celle</th><th>Svar med mærke</th><th>Svar med butik</th>"
         f"<th>Mærker pr. svar</th><th>Butikker pr. svar</th></tr></thead>"
         f"<tbody>{rows}</tbody></table></div>"
+        f'<p class="jump noprint"><a href="#register">Gå til spørgsmålsregisteret — alle 35 spørgsmål og alle 420 svar i fuld længde →</a></p>'
         f'<p class="footnote">Butiks- og mærketal må ikke sammenlignes indbyrdes. '
         f"De deler nævner, men ikke mulighedsrum: et prisspørgsmål kan fremkalde en "
         f"butik, et smagsspørgsmål kan ikke.</p>"
@@ -371,6 +385,187 @@ målingen igen med sine egne nøgler.</p>
 """
 
 
+# --- Section 12: question register -------------------------------------------
+
+
+def question_register(result: dict) -> str:
+    """Static list of all 35 questions, grouped by intent.
+
+    Rendered server-side so it survives printing and works without JavaScript.
+    The interactive case file below it is progressive enhancement, not a
+    prerequisite for reading the page.
+    """
+    by_intent: dict[str, list[dict]] = {}
+    for question in result["questions"]:
+        by_intent.setdefault(question["intent"], []).append(question)
+
+    blocks = []
+    for intent, items in by_intent.items():
+        rows = "".join(
+            f'<li><button class="q-item" data-q="{esc(q["id"])}" type="button">'
+            f'<span class="q-id">{esc(q["id"])}</span>'
+            f'<span class="q-text">{esc(q["text"])}</span></button></li>'
+            for q in items
+        )
+        blocks.append(
+            f'<div class="q-group"><h3 class="q-group-head">{esc(intent)}'
+            f'<span class="q-count">{len(items)} spørgsmål</span></h3>'
+            f"<ul class=\"q-list\">{rows}</ul></div>"
+        )
+    return "".join(blocks)
+
+
+def question_explorer(result: dict, answers: list[dict]) -> str:
+    grouped: dict[str, list[dict]] = {}
+    for answer in answers:
+        grouped.setdefault(answer["prompt_id"], []).append(answer)
+    for items in grouped.values():
+        items.sort(key=lambda a: (CELL_ORDER.index(f"{a['model_key']}/{a['condition']}"), a["pass"]))
+
+    payload = {
+        "cellOrder": CELL_ORDER,
+        "cellLabels": {k: list(v) for k, v in CELL_LABELS.items()},
+        "questions": {q["id"]: q for q in result["questions"]},
+        "answers": {
+            qid: [
+                {
+                    "cell": f"{a['model_key']}/{a['condition']}",
+                    "pass": a["pass"],
+                    "text": a["text"],
+                    "entities": a["entities"],
+                }
+                for a in items
+            ]
+            for qid, items in grouped.items()
+        },
+    }
+    blob = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+
+    return f"""
+<h2 id="register">Spørgsmålsregister</h2>
+<p>Alle {esc(len(result["questions"]))} spørgsmål og alle {esc(len(answers))} svar i fuld
+længde. Vælg et spørgsmål for at se, hvad hver celle svarede, hvilke entiteter der
+optrådte i hvilke kørsler, og den uredigerede tekst bag tallene.</p>
+<p class="footnote"><strong>Ét spørgsmål er tre svar per celle.</strong> Derfor står der
+tællinger — «2 af 3 kørsler» — og aldrig procenter på dette niveau. En procent på tre
+observationer er et decimaltal, der udgiver sig for at være en måling.</p>
+
+<div class="explorer" id="explorer">
+  <div class="q-register">{question_register(result)}</div>
+  <div class="q-detail" id="q-detail" aria-live="polite"></div>
+</div>
+<p class="footnote noprint">Transkripterne er modellernes ord, ikke mine. De indeholder
+modellernes egne påstande om navngivne virksomheders priser og kvalitet, gengivet
+uredigeret, fordi det er grundlaget for tallene ovenfor.</p>
+
+<script type="application/json" id="qdata">{blob}</script>
+<script>
+(function () {{
+  var el = document.getElementById('qdata');
+  if (!el) return;
+  var D = JSON.parse(el.textContent);
+  var detail = document.getElementById('q-detail');
+
+  function esc(s) {{
+    return String(s).replace(/[&<>"]/g, function (c) {{
+      return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c];
+    }});
+  }}
+
+  // Transcripts are shown as transcripts: whitespace preserved, **bold**
+  // honoured, nothing else interpreted. A half-working markdown renderer
+  // would quietly misrepresent the evidence.
+  function transcript(text) {{
+    return esc(text).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  }}
+
+  function dots(present, total) {{
+    var out = '';
+    for (var i = 0; i < total; i++) {{
+      out += '<span class="dot' + (i < present ? ' on' : '') + '"></span>';
+    }}
+    return '<span class="dots">' + out + '</span>';
+  }}
+
+  function render(qid) {{
+    var q = D.questions[qid];
+    if (!q) return;
+    var answers = D.answers[qid] || [];
+
+    var cols = D.cellOrder.map(function (cell) {{
+      var c = q.cells[cell];
+      var label = D.cellLabels[cell] || [cell, ''];
+      if (!c) return '';
+      var body;
+      if (!c.entities.length) {{
+        body = '<p class="q-none">Ingen mærker eller butikker registreret i denne celle.</p>';
+      }} else {{
+        body = '<ul class="q-ents">' + c.entities.map(function (e) {{
+          return '<li><span class="q-ent-name">' + esc(e.display) + '</span>' +
+                 '<span class="q-ent-type">' + esc(e.type) + '</span>' +
+                 dots(e.runs_present, e.runs_total) + '</li>';
+        }}).join('') + '</ul>';
+      }}
+      var flag = c.defunct_errors
+        ? '<p class="q-flag">' + c.defunct_errors + ' af ' + c.runs +
+          ' kørsler anbefalede en udgået kæde</p>'
+        : '';
+      var runs = answers.filter(function (a) {{ return a.cell === cell; }})
+        .map(function (a) {{
+          return '<button type="button" class="q-run" data-q="' + esc(qid) +
+                 '" data-cell="' + esc(cell) + '" data-pass="' + a.pass + '">kørsel ' + a.pass + '</button>';
+        }}).join('');
+      return '<div class="q-cell"><div class="q-cell-head">' + esc(label[0]) +
+             '<em>' + esc(label[1]) + '</em></div>' + body + flag +
+             '<div class="q-runs">' + runs + '</div></div>';
+    }}).join('');
+
+    detail.innerHTML =
+      '<div class="q-detail-head"><span class="q-id">' + esc(qid) + '</span>' +
+      '<span class="q-intent">' + esc(q.intent) + '</span></div>' +
+      '<p class="q-question">' + esc(q.text) + '</p>' +
+      '<p class="q-meta">4 celler × 3 kørsler = 12 svar · tællinger, ikke procenter</p>' +
+      '<div class="q-cells">' + cols + '</div>' +
+      '<div id="q-transcript"></div>';
+
+    document.querySelectorAll('.q-item').forEach(function (b) {{
+      b.classList.toggle('active', b.dataset.q === qid);
+    }});
+  }}
+
+  function showTranscript(qid, cell, pass) {{
+    var a = (D.answers[qid] || []).filter(function (x) {{
+      return x.cell === cell && x.pass === Number(pass);
+    }})[0];
+    var box = document.getElementById('q-transcript');
+    if (!a || !box) return;
+    var label = D.cellLabels[cell] || [cell, ''];
+    box.innerHTML =
+      '<div class="tr"><div class="tr-head">Transkript · ' + esc(label[0]) + ' ' +
+      esc(label[1]) + ' · kørsel ' + esc(pass) + ' · uredigeret' +
+      '<button type="button" class="tr-close">luk</button></div>' +
+      '<div class="tr-body"><span class="tr-attr">Modellens ord, ikke mine</span>' +
+      '<div class="tr-text">' + transcript(a.text) + '</div></div></div>';
+    box.scrollIntoView({{behavior: 'smooth', block: 'nearest'}});
+  }}
+
+  document.addEventListener('click', function (ev) {{
+    var item = ev.target.closest('.q-item');
+    if (item) {{ render(item.dataset.q); return; }}
+    var run = ev.target.closest('.q-run');
+    if (run) {{ showTranscript(run.dataset.q, run.dataset.cell, run.dataset.pass); return; }}
+    if (ev.target.closest('.tr-close')) {{
+      document.getElementById('q-transcript').innerHTML = '';
+    }}
+  }});
+
+  var first = document.querySelector('.q-item');
+  if (first) render(first.dataset.q);
+}})();
+</script>
+"""
+
+
 # --- Page --------------------------------------------------------------------
 
 CSS = """
@@ -450,6 +645,83 @@ blockquote cite{display:block; margin-top:.5rem; font-style:normal; font-size:.7
 
 footer{margin-top:3.5rem; padding-top:1rem; border-top:1px solid var(--rule); font-size:.78rem; color:var(--ink-soft)}
 
+/* --- Section 12: question register --- */
+.explorer{display:grid; grid-template-columns:16rem 1fr; gap:1.25rem; margin:1.25rem 0; align-items:start}
+.q-register{border:1px solid var(--rule); background:rgba(255,255,255,.4); max-height:34rem; overflow-y:auto}
+.q-group-head{
+  display:flex; justify-content:space-between; align-items:baseline; gap:.5rem;
+  margin:0; padding:.5rem .7rem; font-size:.66rem; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--ink-soft);
+  border-bottom:1px solid var(--rule); background:rgba(255,255,255,.5); position:sticky; top:0;
+}
+.q-count{font-size:.62rem; opacity:.8}
+.q-list{list-style:none; margin:0; padding:0}
+.q-item{
+  display:flex; gap:.5rem; width:100%; text-align:left; background:none; cursor:pointer;
+  border:0; border-bottom:1px solid var(--rule); padding:.5rem .7rem;
+  font:inherit; font-size:.8rem; line-height:1.35; color:var(--ink);
+}
+.q-item:hover{background:rgba(255,255,255,.75)}
+.q-item.active{background:var(--ink); color:var(--carton)}
+.q-item.active .q-id{color:var(--carton); opacity:.7}
+.q-id{
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.68rem;
+  color:var(--ink-soft); flex:0 0 auto; padding-top:.1rem;
+}
+.q-detail{border:1px solid var(--rule); background:rgba(255,255,255,.4); padding:1rem}
+.q-detail-head{display:flex; gap:.6rem; align-items:center; font-size:.66rem;
+  letter-spacing:.14em; text-transform:uppercase; color:var(--ink-soft); margin-bottom:.4rem}
+.q-question{font-size:1.15rem; font-weight:700; line-height:1.3; margin:0 0 .35rem}
+.q-meta{font-size:.7rem; letter-spacing:.06em; text-transform:uppercase;
+  color:var(--ink-soft); margin:0 0 1rem}
+.q-cells{display:grid; grid-template-columns:repeat(auto-fit,minmax(11rem,1fr)); gap:.6rem}
+.q-cell{border:1px solid var(--rule); padding:.6rem; background:rgba(255,255,255,.55)}
+.q-cell-head{font-size:.72rem; font-weight:700; margin-bottom:.5rem}
+.q-cell-head em{font-style:normal; font-weight:400; color:var(--ink-soft); display:block; font-size:.68rem}
+.q-ents{list-style:none; margin:0 0 .5rem; padding:0}
+.q-ents li{display:flex; align-items:center; gap:.35rem; margin-bottom:.25rem; font-size:.76rem}
+.q-ent-name{flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.q-ent-type{font-size:.56rem; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-soft)}
+.dots{display:inline-flex; gap:2px; flex:0 0 auto}
+.dot{width:7px; height:11px; background:var(--bar-track); display:block}
+.dot.on{background:var(--bar)}
+.q-none{font-size:.76rem; color:var(--ink-soft); font-style:italic; margin:0 0 .5rem}
+.q-flag{font-size:.72rem; color:var(--stamp); border-left:2px solid var(--stamp);
+  padding-left:.4rem; margin:.4rem 0}
+.q-runs{display:flex; flex-wrap:wrap; gap:.25rem; margin-top:.5rem}
+.q-run{
+  font:inherit; font-size:.66rem; letter-spacing:.06em; text-transform:uppercase;
+  background:none; border:1px solid var(--ink-soft); color:var(--ink);
+  padding:.2rem .4rem; cursor:pointer;
+}
+.q-run:hover{background:var(--ink); color:var(--carton); border-color:var(--ink)}
+.tr{border:1px solid var(--ink); margin-top:1rem; background:rgba(255,255,255,.7)}
+.tr-head{
+  display:flex; justify-content:space-between; align-items:center; gap:.5rem;
+  background:var(--ink); color:var(--carton); padding:.4rem .6rem;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:.64rem; letter-spacing:.1em; text-transform:uppercase;
+}
+.tr-close{font:inherit; background:none; border:1px solid var(--carton);
+  color:var(--carton); padding:.1rem .4rem; cursor:pointer}
+.tr-body{display:grid; grid-template-columns:5.5rem 1fr; gap:.8rem; padding:.8rem}
+.tr-attr{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.6rem;
+  letter-spacing:.08em; text-transform:uppercase; color:var(--stamp); line-height:1.5}
+.tr-text{white-space:pre-wrap; font-size:.84rem; line-height:1.5; overflow-x:auto}
+.jump{display:inline-block; margin:.5rem 0; font-size:.8rem}
+
+@media (max-width:720px){
+  .explorer{grid-template-columns:1fr}
+  .q-register{max-height:16rem}
+  .tr-body{grid-template-columns:1fr; gap:.4rem}
+}
+@media print{
+  .q-detail,.noprint,.q-runs{display:none}
+  .q-register{max-height:none; overflow:visible; border:0; background:none}
+  .explorer{display:block}
+  .q-item{border-bottom:1px solid #ddd}
+}
+
 @media (max-width:420px){
   .sheet{padding:1.25rem .85rem 3rem}
   h1{font-size:1.45rem}
@@ -466,7 +738,7 @@ footer{margin-top:3.5rem; padding-top:1rem; border-top:1px solid var(--rule); fo
 """
 
 
-def build(result: dict) -> str:
+def build(result: dict, answers: list[dict]) -> str:
     meta = result["meta"]
     measured = (meta["last_answer"] or datetime.now(timezone.utc).isoformat())[:10]
     expires = (
@@ -529,6 +801,8 @@ diskuteres konkret frem for principielt.</p>
 
 {method_section(result)}
 
+{question_explorer(result, answers)}
+
 <footer>
   <p>Målt {esc(measured)}. Rapporten er et selvstændigt HTML-dokument uden eksterne
   afhængigheder. Rå svar og API-nøgler er ikke en del af repoet.</p>
@@ -555,8 +829,9 @@ diskuteres konkret frem for principielt.</p>
 
 def main() -> int:
     result = load()
+    answers = load_answers()
     config.REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    config.REPORT_PATH.write_text(build(result), encoding="utf-8")
+    config.REPORT_PATH.write_text(build(result, answers), encoding="utf-8")
     size_kb = config.REPORT_PATH.stat().st_size / 1024
     print(f"Skrev {config.REPORT_PATH} ({size_kb:.0f} kB)")
     print("Åbn den lokalt for at kontrollere, at den renderer uden netværk:")

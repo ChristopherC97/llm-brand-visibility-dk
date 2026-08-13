@@ -82,3 +82,21 @@ Kun to ting, og begge skal skrives ind i denne fil med dato og begrundelse:
    ordbogen, og **hele kørslen genanalyseres**, ikke kun den del der passer.
 
 At tallene er kedelige, er ikke en grund til at ændre planen.
+
+## Tilføjelse 2026-08-13, efter kørslen
+
+Rapporten har fået en **sektion 12: Spørgsmålsregister** med de rå svar.
+
+Ingen af de forudregistrerede sektioner er ændret, fjernet eller omskrevet,
+og ingen tærskel er justeret. Tilføjelsen fjerner intet forbehold. Den går
+den modsatte vej af det, forudregistrering skal beskytte mod: den udstiller
+alle 420 svar i fuld længde, så en læser kan gå fra et hvilket som helst
+aggregeret tal til den rå tekst bag det og efterprøve ekstraktionen selv.
+
+Begrundelse: rapportens kernepåstand er efterprøvelighed. At beholde
+grundlaget skjult, når det kan udgives, ville svække netop den påstand.
+
+Nyt krav, der gælder sektion 12: på spørgsmålsniveau er ét spørgsmål tre
+svar per celle. Der vises **tællinger** ("2 af 3 kørsler"), aldrig procenter.
+En procent på tre observationer er et decimaltal, der udgiver sig for at
+være en måling.
