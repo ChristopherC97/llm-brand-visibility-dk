@@ -1,0 +1,16 @@
+# Nøgler — kommer aldrig i repoet
+.env
+.env.*
+!.env.example
+
+# Rå svar — kan indeholde alt hvad modellerne fandt på at skrive
+data/
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+# Genereret af candidates.py, ikke en del af målingen
+candidates.md
