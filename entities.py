@@ -191,6 +191,20 @@ STORES: tuple[Entity, ...] = (
     Entity("fleggaard", "Fleggaard", EntityType.STORE, (Alias("Fleggaard"),)),
     Entity("calle", "Calle", EntityType.STORE, (Alias("Calle"), Alias("Poetzsch Calle"))),
     Entity("ottoduborg", "Otto Duborg", EntityType.STORE, (Alias("Otto Duborg"),)),
+    # --- added after the full run's unknown-name dump ---
+    # Bare "Brugsen" is how people refer to both SuperBrugsen and Dagli'Brugsen.
+    # It cannot false-match inside those names: the lookbehind rejects a
+    # preceding letter, so "SuperBrugsen" never yields a bare "Brugsen".
+    Entity("brugsen", "Brugsen", EntityType.STORE, (Alias("Brugsen"),)),
+    Entity("aarstiderne", "Aarstiderne", EntityType.STORE, (Alias("Aarstiderne"), Alias("Årstiderne"))),
+    Entity("reko", "REKO", EntityType.STORE, (Alias("REKO-ring"), Alias("REKO"))),
+    Entity(
+        "toogoodtogo",
+        "Too Good To Go",
+        EntityType.STORE,
+        (Alias("Too Good To Go"),),
+        note="App mod madspild",
+    ),
     # Defunct chains — still matched, then flagged separately.
     Entity("aldi", "Aldi", EntityType.STORE, (Alias("Aldi"), Alias("ALDI"))),
     Entity("irma", "Irma", EntityType.STORE, (Alias("Irma"),)),
@@ -287,6 +301,44 @@ BRANDS: tuple[Entity, ...] = (
     Entity("levevis", "Levevis", EntityType.BRAND, (Alias("Levevis"),), note="Coops eget mærke"),
     Entity("danone", "Danone", EntityType.BRAND, (Alias("Danone"),)),
     Entity("activia", "Activia", EntityType.BRAND, (Alias("Activia"),)),
+    # --- added after the full run's unknown-name dump ---
+    # Product brands the first dictionary missed entirely. All surfaced by the
+    # data, none guessed. This was a large gap: the whole run was re-analysed
+    # after adding them, per report_plan.md.
+    Entity("cocio", "Cocio", EntityType.BRAND, (Alias("Cocio"),)),
+    Entity("mycella", "Mycella", EntityType.BRAND, (Alias("Mycella"),)),
+    Entity("havgus", "Havgus", EntityType.BRAND, (Alias("Havgus"),)),
+    Entity("gamleole", "Gamle Ole", EntityType.BRAND, (Alias("Gamle Ole"),)),
+    Entity("gammelknas", "Gammel Knas", EntityType.BRAND, (Alias("Gammel Knas"),)),
+    Entity("yoggi", "Yoggi", EntityType.BRAND, (Alias("Yoggi"),)),
+    Entity("philadelphia", "Philadelphia", EntityType.BRAND, (Alias("Philadelphia"),)),
+    Entity("mariusboel", "Marius Boel", EntityType.BRAND, (Alias("Marius Boel"),)),
+    Entity("knuthenlund", "Knuthenlund", EntityType.BRAND, (Alias("Knuthenlund"),)),
+    Entity("nordexfood", "Nordex Food", EntityType.BRAND, (Alias("Nordex Food"),)),
+    # Private labels.
+    Entity("xtra", "Xtra", EntityType.BRAND, (Alias("Xtra"),), note="Coops billigmærke"),
+    Entity("bakkedal", "Bakkedal", EntityType.BRAND, (Alias("Bakkedal"),), note="Eget mærke"),
+    Entity(
+        "groenbalance",
+        "Grøn Balance",
+        EntityType.BRAND,
+        (Alias("Grøn Balance"), Alias("Groen Balance")),
+        note="Coops økologimærke",
+    ),
+    # "gestus" is also an ordinary Danish noun ("a gesture"), so capital only
+    # and never in front of the words it takes in that reading.
+    Entity(
+        "gestus",
+        "Gestus",
+        EntityType.BRAND,
+        (Alias("Gestus", require_capital=True, forbidden_next=r"\s+(mod|over\s+for|til)\b"),),
+        note="Dagrofas eget mærke",
+    ),
+    # Small Danish dairies named in the answers.
+    Entity("jernved", "Jernved Mejeri", EntityType.BRAND, (Alias("Jernved Mejeri"), Alias("Jernved"))),
+    Entity("endrup", "Endrup Andelsmejeri", EntityType.BRAND, (Alias("Endrup Andelsmejeri"), Alias("Endrup Mejeri"))),
+    Entity("ingstrup", "Ingstrup Mejeri", EntityType.BRAND, (Alias("Ingstrup Mejeri"),)),
+    Entity("soenderhaven", "Sønderhaven Gårdmejeri", EntityType.BRAND, (Alias("Sønderhaven Gårdmejeri"), Alias("Sønderhaven"))),
 )
 
 

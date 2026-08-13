@@ -94,6 +94,15 @@ def test_inflection_and_compounds() -> None:
     # But a name glued into a longer word must not match.
     expect_no_match("Arlaskyrprodukterne er nye.", "arla")
 
+    # Short aliases added after the full run must not fire inside longer names.
+    expect_no_match("SuperBrugsen har et bredt udvalg.", "brugsen")
+    expect_no_match("Dagli'Brugsen ligger i landsbyen.", "brugsen")
+    expect_match("Jeg køber ind i Brugsen.", "brugsen")
+    expect_no_match("Der er ekstra rabat i denne uge.", "xtra")
+    expect_match("Xtra-mælk er billigst.", "xtra")
+    expect_no_match("Det var en pæn gestus mod kunderne.", "gestus")
+    expect_match("Gestus er Dagrofas eget mærke.", "gestus")
+
 
 def test_first_occurrence_and_overlap() -> None:
     text = "Arla og Arla og Arla laver mælk. Min Købmand fører den."
@@ -107,7 +116,12 @@ def test_generic_words_are_not_entities() -> None:
     """The skyr lesson: product categories must not be in the dictionary."""
     # "Danbo" was surfaced by the pilot's unknown-name dump. It is a protected
     # cheese type, not a brand — same trap as skyr, so it stays out on purpose.
-    for generic in ("skyr", "ymer", "hytteost", "kærnemælk", "danablu", "danbo", "havarti"):
+    # Cheese types surfaced by the full run's dump. Gruyère, Comté and
+    # Grana Padano are categories in exactly the way skyr is, and stay out.
+    for generic in (
+        "skyr", "ymer", "hytteost", "kærnemælk", "danablu", "danbo", "havarti",
+        "gruyère", "comté", "grana padano", "feta", "mozzarella", "brie",
+    ):
         check(
             generic.lower() not in {a.lower() for a in entities.all_entity_surface_forms()},
             f"{generic!r} er en produktkategori og må ikke stå i ordbogen",
