@@ -214,8 +214,10 @@ def cover(result: dict, measured: str, expires: str) -> str:
   <div>
     <h1>Når en dansker spørger en sprogmodel om mejeri, <em>hvem bliver så nævnt</em>
       — og hvem findes slet ikke i svaret?</h1>
-    <p class="stand">Analyseenheden er spørgsmålet, ikke mærket.
-      {esc(meta['questions'])} spørgsmål på dansk blev stillet i {esc(cells)} celler og
+    <p class="stand">Der er ikke spurgt om et eneste mærke. De
+      {esc(meta['questions'])} spørgsmål er stillet, som en forbruger ville stille dem, og
+      navnene i svarene er dem, modellerne selv trak ind.
+      {esc(meta['questions'])} spørgsmål på dansk blev stillet i {esc(cells)} kombinationer og
       kørt {esc(passes)} gange i hver: {esc(meta['answers'])} svar. Ingen af spørgsmålene
       nævner et mærke- eller butiksnavn. Rapporten kan læses fra opsummeringen og ned,
       eller åbnes ved et enkelt spørgsmål — alle {esc(meta['answers'])} svar ligger i den
@@ -230,7 +232,7 @@ def cover(result: dict, measured: str, expires: str) -> str:
     </div>
     <div class="facts">
       <dl>
-        <dt>Omfang</dt><dd>{esc(meta['questions'])} spørgsmål · {esc(cells)} celler ·
+        <dt>Omfang</dt><dd>{esc(meta['questions'])} spørgsmål · {esc(cells)} kombinationer ·
           {esc(passes)} kørsler</dd>
         <dt>Grundlag</dt><dd>{esc(meta['answers'])} svar</dd>
         <dt>Modeller</dt><dd>{esc(models)}</dd>
@@ -265,7 +267,7 @@ def summary_cards(result: dict, brands: dict, shops: dict) -> str:
     # is computed, not assumed — if a future run breaks it, the sentence changes.
     no_visible_shop = all(d["_band"] != "synlig" for d in shops["rows"])
     shop_tail = (
-        " Ingen dagligvarekæde når over 40&nbsp;% i nogen af de fire celler."
+        " Ingen dagligvarekæde når over 40&nbsp;% i nogen af de fire kombinationer."
         if no_visible_shop else ""
     )
 
@@ -275,14 +277,14 @@ def summary_cards(result: dict, brands: dict, shops: dict) -> str:
             "fig": pct(top_brand["rate"]),
             "who": top_brand["entity"]["display"],
             "sen": (
-                f"af de {result['meta']['cell_sizes'][top_brand['cell']]} svar i cellen "
+                f"af de {result['meta']['cell_sizes'][top_brand['cell']]} svar i kombinationen "
                 f"{esc(cell_name(top_brand['cell']))} nævner "
                 f"{esc(top_brand['entity']['display'])} mindst én gang. I "
                 f"{esc(cell_name(top_brand['low_cell']))} er det "
                 f"{pct(top_brand['low_rate'])} — samme spørgsmål, samme dag."
             ),
             "ref": (
-                f"celle: {esc(cell_name(top_brand['cell']))} · modsat yderpunkt: "
+                f"kombination: {esc(cell_name(top_brand['cell']))} · modsat yderpunkt: "
                 f"{esc(cell_name(top_brand['low_cell']))}"
             ),
         },
@@ -291,22 +293,22 @@ def summary_cards(result: dict, brands: dict, shops: dict) -> str:
             "fig": pct(top_shop["rate"]),
             "who": top_shop["entity"]["display"],
             "sen": (
-                f"af svarene i cellen {esc(cell_name(top_shop['cell']))} nævner "
+                f"af svarene i kombinationen {esc(cell_name(top_shop['cell']))} nævner "
                 f"{esc(top_shop['entity']['display'])}. I "
                 f"{esc(cell_name(top_shop['low_cell']))} er det "
                 f"{pct(top_shop['low_rate'])}.{shop_tail}"
             ),
             "ref": (
-                f"celle: {esc(cell_name(top_shop['cell']))} · butiks- og mærketal har "
+                f"kombination: {esc(cell_name(top_shop['cell']))} · butiks- og mærketal har "
                 f"hver sin akse"
             ),
         },
         {
-            "lb": "Usynlige i alle fire celler",
+            "lb": "Usynlige i alle fire kombinationer",
             "fig": f"{inv_b} af {n_b}",
             "who": "mejerimærker",
             "sen": (
-                f"ligger under 10&nbsp;% i <em>alle</em> fire celler — nævnt, men "
+                f"ligger under 10&nbsp;% i <em>alle</em> fire kombinationer — nævnt, men "
                 f"praktisk taget uden for svaret uanset hvilken model forbrugeren "
                 f"bruger. For butikker: {inv_s} af {n_s}."
             ),
@@ -329,15 +331,15 @@ def summary_cards(result: dict, brands: dict, shops: dict) -> str:
                     if clean_cells else ""
                 )
             ),
-            "ref": f"celler: {esc(cell_name(worst_cell))} → {esc(cell_name(other))}",
+            "ref": f"kombinationer: {esc(cell_name(worst_cell))} → {esc(cell_name(other))}",
         },
         {
             "lb": "Enighed mellem modellerne",
             "fig": f"{dec(nos)} → {dec(sea)}",
             "who": "overlap på de mest omtalte",
             "sen": (
-                "Uden søgning svarer de to modeller fra beslægtede hukommelser. Med "
-                "søgning henter de hver sit — og bliver uenige om, hvem der findes."
+                "Uden søgning peger de to modeller på stort set de samme navne. Med "
+                "søgning gør de ikke. Hvorfor, kan målingen ikke sige."
             ),
             "ref": "Jaccard, beregnet inden for samme betingelse",
         },
@@ -354,15 +356,15 @@ def summary_cards(result: dict, brands: dict, shops: dict) -> str:
 <section class="window lpurple" id="kort">
   <div class="wtop">
     <h2>Kort fortalt</h2>
-    <div class="r">Hvert tal hører til én navngiven celle · ingen af tallene er et
+    <div class="r">Hvert tal hører til én navngiven kombination · ingen af tallene er et
       gennemsnit af de fire</div>
   </div>
   <div class="cards">{html_cards}{intent_cards}</div>
   <p class="small" style="margin:24px 0 0">Der findes ikke ét samlet synlighedstal i
-    rapporten, og det er ikke tilbageholdenhed: de fire celler måler ikke det samme, og
+    rapporten, og det er ikke tilbageholdenhed: de fire kombinationer måler ikke det samme, og
     et gennemsnit af dem ville være et tal, ingen bruger nogensinde har mødt. Derfor står
-    hvert tal med den celle, det kommer fra — og hvor det er relevant, står tallet fra
-    den celle, hvor det ser dårligst ud, lige ved siden af.</p>
+    hvert tal med den kombination, det kommer fra — og hvor det er relevant, står tallet fra
+    den kombination, hvor det ser dårligst ud, lige ved siden af.</p>
 </section>
 """
 
@@ -455,7 +457,7 @@ def questions_section(result: dict, answers: list[dict]) -> str:
   <div class="wtop">
     <h2>Spørgsmålene</h2>
     <div class="r">Alle {esc(meta['questions'])} spørgsmål er gengivet ordret ·
-      klik for at se hvad hver celle svarede</div>
+      klik for at se hvad hver kombination svarede</div>
   </div>
   <p class="stand" style="margin-bottom:26px">De {esc(meta['questions'])} spørgsmål er den
     svageste antagelse i hele arbejdet. Derfor ligger de her og ikke i et bilag: man skal
@@ -471,7 +473,7 @@ def questions_section(result: dict, answers: list[dict]) -> str:
     <div>
       {lists}
       <p class="small" style="margin-top:18px">Der står ingen procenter pr. spørgsmål
-        nogen steder i rapporten. Ét spørgsmål er {esc(n_runs)} svar pr. celle, og en
+        nogen steder i rapporten. Ét spørgsmål er {esc(n_runs)} svar pr. kombination, og en
         procent på {esc(n_runs)} svar er et decimaltal, der udgiver sig for at være en
         måling. Spørgsmålsniveauet opgøres i tællinger.</p>
     </div>
@@ -534,7 +536,7 @@ def question_panel(question: dict, per_q: int, n_runs: int) -> str:
             cols.append(
                 f'<div class="qcell"><div class="qcell-head">{esc(model)}'
                 f"<em>{esc(condition)}</em></div>"
-                f'<p class="qnone">Cellen indgår i målingen, men payloaden er ikke '
+                f'<p class="qnone">Kombinationen indgår i målingen, men payloaden er ikke '
                 f"leveret for dette spørgsmål.</p></div>"
             )
             continue
@@ -554,7 +556,7 @@ def question_panel(question: dict, per_q: int, n_runs: int) -> str:
         else:
             body = (
                 '<p class="qnone">Ingen mærker eller butikker registreret i denne '
-                "celle.</p>"
+                "kombination.</p>"
             )
         flag = (
             f'<p class="qerr">{data["defunct_errors"]} af {data["runs"]} kørsler '
@@ -583,7 +585,7 @@ def question_panel(question: dict, per_q: int, n_runs: int) -> str:
   <div class="tslot"></div>
   <p class="small" style="max-width:36em;margin:14px 0 0">Tallene er tællinger, ikke
     procenter: «{esc(n_runs)} af {esc(n_runs)} kørsler» betyder, at entiteten optrådte i
-    alle {esc(n_runs)} svar fra den celle. Transkripterne er modellens ord og modellens
+    alle {esc(n_runs)} svar fra den kombination. Transkripterne er modellens ord og modellens
     påstande om navngivne virksomheder — ikke rapportens, og ikke efterprøvet mod en
     butikshylde.</p>
 </div>
@@ -596,10 +598,10 @@ def question_panel(question: dict, per_q: int, n_runs: int) -> str:
 def matrix_section(result: dict, brands: dict, shops: dict) -> str:
     tables = "".join(matrix_table(result, fam) for fam in (brands, shops))
     return f"""
-<section class="window dark" id="celler">
+<section class="window dark" id="kombinationer">
   <div class="wtop">
-    <h2>Fire celler, samme entiteter</h2>
-    <div class="r">Alle fire celler vises altid · ingen knap lægger dem sammen</div>
+    <h2>Fire kombinationer, samme entiteter</h2>
+    <div class="r">Alle fire kombinationer vises altid · ingen knap lægger dem sammen</div>
   </div>
   <div class="pills noprint" style="margin-bottom:26px">
     <button class="pill" type="button" data-fam="brands" aria-pressed="true">Mærker</button>
@@ -633,7 +635,7 @@ def matrix_table(result: dict, fam: dict) -> str:
     top_key = "top_brands" if fam["type"] == "maerke" else "top_stores"
 
     head = (
-        f'<thead><tr><th>{esc(fam["label"])}<span>Omtale-rate pr. celle</span></th>'
+        f'<thead><tr><th>{esc(fam["label"])}<span>Omtale-rate pr. kombination</span></th>'
         + "".join(
             f'<th class="cellcol">{esc(CELL_LABELS[c][1])}<span>{esc(CELL_LABELS[c][0])}</span></th>'
             for c in cells
@@ -647,9 +649,9 @@ def matrix_table(result: dict, fam: dict) -> str:
             current_band = data["_band"]
             count = sum(1 for d in fam["rows"] if d["_band"] == current_band)
             copy = {
-                "synlig": "synlig i mindst én celle · over 40&nbsp;%",
+                "synlig": "synlig i mindst én kombination · over 40&nbsp;%",
                 "marginal": "marginal i sit bedste tilfælde · 10–40&nbsp;%",
-                "usynlig": "under 10&nbsp;% i alle fire celler",
+                "usynlig": "under 10&nbsp;% i alle fire kombinationer",
             }[current_band]
             body.append(
                 f'<tr class="grp"><td colspan="{len(cells) + 1}">'
@@ -716,7 +718,12 @@ def matrix_table(result: dict, fam: dict) -> str:
 
 
 def topline_strip(result: dict, fam: dict) -> str:
-    """Per-cell coverage for one family. Four figures, never one."""
+    """Per-combination coverage for one family. Four figures, never one.
+
+    Where the two conditions of the same model land on the identical figure, the
+    strip says so. Two neighbouring 75 % read as a copy-paste error otherwise,
+    and the second line is what keeps the pair from being read as one finding.
+    """
     share_key = "share_with_brand" if fam["type"] == "maerke" else "share_with_store"
     avg_key = "avg_brands_per_answer" if fam["type"] == "maerke" else "avg_stores_per_answer"
     word = "mærke" if fam["type"] == "maerke" else "butik"
@@ -730,7 +737,26 @@ def topline_strip(result: dict, fam: dict) -> str:
         f'{esc(word)} · {dec(result["toplines"][c][avg_key], 2)} {esc(plural)} pr. svar</div></div>'
         for c in fam["cells"]
     )
-    return f'<div class="tls">{blocks}</div>'
+
+    ties = []
+    for model_id in result["meta"]["models"]:
+        pair = [c for c in fam["cells"] if c.startswith(f"{model_id}/")]
+        if len(pair) != 2:
+            continue
+        first, second = (result["toplines"][c] for c in pair)
+        if first[share_key] != second[share_key]:
+            continue
+        label = CELL_LABELS[pair[0]][0]
+        # Inde i rækkens egen ramme, ikke under skillestregen: linjen hører til de
+        # fire tal ovenover, ikke til tabellen nedenunder.
+        ties.append(
+            f'<p class="small" style="grid-column:1/-1;margin:2px 0 0">De to '
+            f"{esc(label)}-kombinationer rammer samme tal for dækning. Antallet af "
+            f"{esc(plural)} pr. svar gør ikke: "
+            f'{dec(first[avg_key])} mod {dec(second[avg_key])}.</p>'
+        )
+
+    return f'<div class="tls">{blocks}{"".join(ties)}</div>'
 
 
 # --- Section 4: defunct chains and disagreement ------------------------------
@@ -805,7 +831,7 @@ def defunct_section(result: dict) -> str:
         )
         body = (
             f'<table class="t">'
-            f"<thead><tr><th>Celle</th><th>Svar med fejl</th><th>Andel</th>"
+            f"<thead><tr><th>Kombination</th><th>Svar med fejl</th><th>Andel</th>"
             f'<th>Svar der beskriver lukningen korrekt</th>'
             f'<th class="txt">Hvilke kæder</th></tr></thead>'
             f"<tbody>{rows}</tbody></table>"
@@ -830,14 +856,16 @@ def defunct_section(result: dict) -> str:
     return f"""
 <section class="window plain" id="kaeder">
   <h2>Kæder, der ikke findes</h2>
-  <p class="stand" style="margin-bottom:22px">Tre danske dagligvarekæder findes ikke
-    længere. Anbefales de stadig, uden at lukningen nævnes, er det ikke en smagssag, men
-    faktuelt forkert købsråd leveret med samme sikkerhed som det rigtige.</p>
+  <p class="stand" style="margin-bottom:22px">Tre danske dagligvarekæder eksisterer ikke
+    længere under det navn. Anbefales de stadig, uden at lukningen nævnes, er det ikke en
+    smagssag, men faktuelt forkert købsråd leveret med samme sikkerhed som det rigtige.</p>
   <div class="gonelist">{chain_list}</div>
   {body}
-  <h3>Enigheden falder, når modellerne får adgang til nutiden</h3>
-  <p>Overlappet er beregnet inden for hver betingelse. At sammenligne en søgende model
-    med en ikke-søgende ville måle indstillingen, ikke modellerne.</p>
+  <h3>Enigheden halveres, når websøgning slås til</h3>
+  <p>{dec(result['disagreement']['nosearch']['jaccard'])} mod
+    {dec(result['disagreement']['search']['jaccard'])}. Overlappet er beregnet inden for
+    hver betingelse. At sammenligne en søgende model med en ikke-søgende ville måle
+    indstillingen, ikke modellerne.</p>
   <table class="t">
     <thead><tr><th>Betingelse</th><th>Jaccard-overlap</th><th>Fælles navne</th>
       <th class="txt">Hvem står alene</th></tr></thead>
@@ -962,11 +990,11 @@ def method_section(result: dict) -> str:
     med «Arla» i ville måle genkendelse, ikke synlighed. Det håndhæves af en test i
     pipelinen, ikke af disciplin.</p>
   <h3>Design</h3>
-  <p>{esc(n_cells)} celler: to modeller × to betingelser (uden og med websøgning). Hver
-    celle kørt {esc(n_runs)} gange med timers mellemrum, så konsistens også afspejler
+  <p>{esc(n_cells)} kombinationer: to modeller × to betingelser (uden og med websøgning). Hver
+    kombination kørt {esc(n_runs)} gange med timers mellemrum, så konsistens også afspejler
     variation over tid og ikke kun modellens tilfældighed i det enkelte kald.
     {esc(n_cells)} × {esc(meta['questions'])} × {esc(n_runs)} =
-    {esc(meta['answers'])} svar, {esc(per_cell)} pr. celle. Tidsrum: {esc(spans)}.
+    {esc(meta['answers'])} svar, {esc(per_cell)} pr. kombination. Tidsrum: {esc(spans)}.
     {esc(truncated)}</p>
   <h3>Modeller og indstillinger</h3>
   <p>{esc(models)}. Ingen systemprompt, udbyderens øvrige standardindstillinger.
@@ -987,7 +1015,7 @@ def method_section(result: dict) -> str:
     stednavne, som med vilje ikke er entiteter:</p>
   <div class="chips">{unknown}</div>
   <h3>Optælling og usikkerhed</h3>
-  <p>Omtale-rate er andelen af cellens {esc(per_cell)} svar, hvor entiteten optræder
+  <p>Omtale-rate er andelen af kombinationens {esc(per_cell)} svar, hvor entiteten optræder
     mindst én gang; fem omtaler i ét svar tæller som én. Bånd: synlig over 40&nbsp;%,
     marginal 10–40&nbsp;%, usynlig under 10&nbsp;%. Ingen placeringer, fordi intervallerne
     på n&nbsp;=&nbsp;{esc(meta['questions'])} er brede nok til, at en rangorden ville være
@@ -995,8 +1023,8 @@ def method_section(result: dict) -> str:
   <h3>Forudregistrering og efterprøvning</h3>
   <p>Rapportens sektioner og båndgrænser blev låst i
     <span class="mono">report_plan.md</span> før den fulde kørsel; git-historikken viser
-    hvornår. Spørgsmål, prompts, rå svar, optællingskode og de fire celletabeller ligger
-    samlet og tidsstemplet. Den, der vil modsige et tal her, skal kunne gøre det ved at
+    hvornår. Spørgsmål, prompts, rå svar, optællingskode og de fire kombinationstabeller
+    ligger samlet og tidsstemplet. Den, der vil modsige et tal her, skal kunne gøre det ved at
     køre målingen igen.</p>
 </section>
 """
@@ -1036,7 +1064,7 @@ def appendix(result: dict, brands: dict, shops: dict) -> str:
             f'<div class="famblock fam-{fam["fam"]}">'
             f'<h3 class="famhead">{esc(fam["label"])}</h3>'
             f'<div class="mwrap"><table class="t app">'
-            f"<thead><tr><th>Entitet</th><th>Celle</th><th>Svar med omtale</th>"
+            f"<thead><tr><th>Entitet</th><th>Kombination</th><th>Svar med omtale</th>"
             f"<th>Omtale-rate</th><th>95&nbsp;%-interval</th><th>Share of voice</th>"
             f'<th>Først nævnt</th><th>Konsistens</th><th class="txt">Bånd</th></tr></thead>'
             f'<tbody>{"".join(rows)}</tbody></table></div></div>'
@@ -1053,11 +1081,11 @@ def appendix(result: dict, brands: dict, shops: dict) -> str:
     <button class="pill" type="button" data-fam="brands" aria-pressed="true">Mærker</button>
     <button class="pill" type="button" data-fam="shops" aria-pressed="false">Butikker</button>
   </div>
-  <p>Samme fire celler, alle mål. Share of voice er entitetens andel af alle omtaler i
-    cellen. «Først nævnt» er andelen af de svar med omtale, hvor entiteten stod først.
+  <p>Samme fire kombinationer, alle mål. Share of voice er entitetens andel af alle omtaler i
+    kombinationen. «Først nævnt» er andelen af de svar med omtale, hvor entiteten stod først.
     Konsistens er andelen af kørsler, hvor entiteten optrådte, blandt de spørgsmål hvor
     den optrådte mindst én gang — en entitet med lav konsistens er ikke synlig, den er
-    heldig. Rækker uden omtaler i en celle er udeladt af den celle, ikke af tabellen.</p>
+    heldig. Rækker uden omtaler i en kombination er udeladt af den kombination, ikke af tabellen.</p>
   {''.join(blocks)}
 </section>
 """
@@ -1517,7 +1545,7 @@ def build(result: dict, answers: list[dict]) -> str:
     # rerun with other numbers cannot leave a stale claim in the preview card.
     share_text = (
         f"{meta['questions']} danske spørgsmål om mejeri, stillet i "
-        f"{len(meta['cells'])} celler × {len(meta['passes'])} kørsler = "
+        f"{len(meta['cells'])} kombinationer × {len(meta['passes'])} kørsler = "
         f"{meta['answers']} svar. Hvilke mærker og dagligvarekæder nævner "
         f"sprogmodellerne — og hvem findes slet ikke i svaret? Målt "
         f"{dk_date(measured)}, mindst holdbar til {expires}."
@@ -1535,7 +1563,7 @@ def build(result: dict, answers: list[dict]) -> str:
 <div class="foot">
   <span>Måling {esc(dk_date(measured))}</span>
   <span>Mindst holdbar til {esc(expires)}</span>
-  <span>{esc(meta['questions'])} spørgsmål · {esc(len(meta['cells']))} celler ·
+  <span>{esc(meta['questions'])} spørgsmål · {esc(len(meta['cells']))} kombinationer ·
     {esc(meta['answers'])} svar</span>
   <span>Ingen anbefalinger til navngivne virksomheder</span>
 </div>
